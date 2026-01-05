@@ -107,7 +107,7 @@ my-plugin/
 ### Plugin Entry Point
 
 ```typescript
-import type { PluginContext, PluginActivation } from '@anthropic-ai/alma-plugin-api';
+import type { PluginContext, PluginActivation } from 'alma-plugin-api';
 
 export async function activate(context: PluginContext): Promise<PluginActivation> {
     const { logger, tools, commands, hooks, ui, settings } = context;
@@ -210,7 +210,7 @@ alma plugin install <package-name>
 
 ```bash
 npm init -y
-npm install -D typescript @anthropic-ai/alma-plugin-api
+npm install -D typescript alma-plugin-api
 npx tsc --init
 ```
 

@@ -1,4 +1,4 @@
-import type { PluginContext, PluginActivation } from '@anthropic-ai/alma-plugin-api';
+import type { PluginContext, PluginActivation } from 'alma-plugin-api';
 
 /**
  * Hello World Plugin

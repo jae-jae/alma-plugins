@@ -1,4 +1,4 @@
-import type { PluginContext, PluginActivation, StatusBarItem } from '@anthropic-ai/alma-plugin-api';
+import type { PluginContext, PluginActivation, StatusBarItem } from 'alma-plugin-api';
 
 /**
  * Token Counter Plugin
