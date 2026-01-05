@@ -4,7 +4,7 @@ import type { PluginContext, PluginActivation } from 'alma-plugin-api';
  * Tool Monitor Plugin
  *
  * Monitors and tracks all tool executions with detailed statistics:
- * - Execution count per tool
+ * - Execution count per tool (per thread)
  * - Success/failure rates
  * - Average execution time
  * - Real-time status bar display
@@ -25,6 +25,12 @@ interface ExecutionRecord {
     duration: number;
     success: boolean;
     error?: string;
+    threadId: string;
+}
+
+interface ThreadStats {
+    toolStats: Map<string, ToolStats>;
+    recentExecutions: ExecutionRecord[];
 }
 
 export async function activate(context: PluginContext): Promise<PluginActivation> {
@@ -32,10 +38,27 @@ export async function activate(context: PluginContext): Promise<PluginActivation
 
     logger.info('Tool Monitor plugin activated!');
 
-    // Statistics storage
-    const toolStats = new Map<string, ToolStats>();
-    const recentExecutions: ExecutionRecord[] = [];
+    // Statistics storage - per thread
+    const threadStatsMap = new Map<string, ThreadStats>();
+    let currentThreadId: string | null = null;
     const MAX_RECENT = 100;
+
+    // Get or create stats for a thread
+    const getThreadStats = (threadId: string): ThreadStats => {
+        if (!threadStatsMap.has(threadId)) {
+            threadStatsMap.set(threadId, {
+                toolStats: new Map<string, ToolStats>(),
+                recentExecutions: [],
+            });
+        }
+        return threadStatsMap.get(threadId)!;
+    };
+
+    // Get current thread's stats
+    const getCurrentThreadStats = (): ThreadStats | null => {
+        if (!currentThreadId) return null;
+        return getThreadStats(currentThreadId);
+    };
 
     // Status bar item
     const statusItem = ui.createStatusBarItem({
@@ -50,27 +73,33 @@ export async function activate(context: PluginContext): Promise<PluginActivation
         logToConsole: settings.get<boolean>('toolMonitor.logToConsole', true),
     });
 
-    // Get or create stats for a tool
-    const getStats = (tool: string): ToolStats => {
-        if (!toolStats.has(tool)) {
-            toolStats.set(tool, {
+    // Get or create stats for a tool in a specific thread
+    const getToolStats = (threadId: string, tool: string): ToolStats => {
+        const threadStats = getThreadStats(threadId);
+        if (!threadStats.toolStats.has(tool)) {
+            threadStats.toolStats.set(tool, {
                 calls: 0,
                 successes: 0,
                 failures: 0,
                 totalTime: 0,
             });
         }
-        return toolStats.get(tool)!;
+        return threadStats.toolStats.get(tool)!;
     };
 
-    // Calculate totals
+    // Calculate totals for current thread
     const getTotals = () => {
+        const threadStats = getCurrentThreadStats();
+        if (!threadStats) {
+            return { totalCalls: 0, totalSuccesses: 0, totalFailures: 0, totalTime: 0 };
+        }
+
         let totalCalls = 0;
         let totalSuccesses = 0;
         let totalFailures = 0;
         let totalTime = 0;
 
-        for (const stats of toolStats.values()) {
+        for (const stats of threadStats.toolStats.values()) {
             totalCalls += stats.calls;
             totalSuccesses += stats.successes;
             totalFailures += stats.failures;
@@ -89,6 +118,7 @@ export async function activate(context: PluginContext): Promise<PluginActivation
             return;
         }
 
+        const threadStats = getCurrentThreadStats();
         const { totalCalls, totalFailures } = getTotals();
 
         if (totalCalls === 0) {
@@ -99,22 +129,24 @@ export async function activate(context: PluginContext): Promise<PluginActivation
             statusItem.text = `Tools: ${totalCalls}${failureIndicator}`;
 
             // Build tooltip
-            const lines = ['Tool Execution Summary', ''];
+            const lines = ['Tool Execution Summary (Current Thread)', ''];
 
-            const sortedTools = Array.from(toolStats.entries())
-                .sort((a, b) => b[1].calls - a[1].calls)
-                .slice(0, 5);
+            if (threadStats) {
+                const sortedTools = Array.from(threadStats.toolStats.entries())
+                    .sort((a, b) => b[1].calls - a[1].calls)
+                    .slice(0, 5);
 
-            for (const [tool, stats] of sortedTools) {
-                const avgTime = stats.calls > 0 ? stats.totalTime / stats.calls : 0;
-                const successRate = stats.calls > 0
-                    ? ((stats.successes / stats.calls) * 100).toFixed(0)
-                    : '0';
-                lines.push(`${tool}: ${stats.calls} calls, ${successRate}% success, ${avgTime.toFixed(0)}ms avg`);
-            }
+                for (const [tool, stats] of sortedTools) {
+                    const avgTime = stats.calls > 0 ? stats.totalTime / stats.calls : 0;
+                    const successRate = stats.calls > 0
+                        ? ((stats.successes / stats.calls) * 100).toFixed(0)
+                        : '0';
+                    lines.push(`${tool}: ${stats.calls} calls, ${successRate}% success, ${avgTime.toFixed(0)}ms avg`);
+                }
 
-            if (toolStats.size > 5) {
-                lines.push(`... and ${toolStats.size - 5} more tools`);
+                if (threadStats.toolStats.size > 5) {
+                    lines.push(`... and ${threadStats.toolStats.size - 5} more tools`);
+                }
             }
 
             lines.push('', 'Click for full statistics');
@@ -131,14 +163,27 @@ export async function activate(context: PluginContext): Promise<PluginActivation
         return `${(ms / 60000).toFixed(1)}m`;
     };
 
+    // Track thread activation
+    const threadActivatedDisposable = events.on('thread.activated', (input) => {
+        currentThreadId = input.threadId;
+        logger.debug(`Switched to thread: ${input.threadId}`);
+        updateStatusBar();
+    });
+
     // Track tool execution start
     const willExecuteDisposable = events.on('tool.willExecute', (input) => {
         const { logToConsole } = getSettings();
+        const threadId = input.context.threadId;
+
+        // Update current thread if not set
+        if (!currentThreadId) {
+            currentThreadId = threadId;
+        }
 
         if (logToConsole) {
             logger.info(`[Tool] Starting: ${input.tool}`, {
                 args: input.args,
-                thread: input.context.threadId,
+                thread: threadId,
             });
         }
     });
@@ -146,7 +191,9 @@ export async function activate(context: PluginContext): Promise<PluginActivation
     // Track tool execution completion
     const didExecuteDisposable = events.on('tool.didExecute', (input) => {
         const { logToConsole } = getSettings();
-        const stats = getStats(input.tool);
+        const threadId = input.context.threadId;
+        const stats = getToolStats(threadId, input.tool);
+        const threadStats = getThreadStats(threadId);
 
         stats.calls++;
         stats.successes++;
@@ -154,29 +201,35 @@ export async function activate(context: PluginContext): Promise<PluginActivation
         stats.lastCall = Date.now();
 
         // Record execution
-        recentExecutions.push({
+        threadStats.recentExecutions.push({
             tool: input.tool,
             timestamp: Date.now(),
             duration: input.duration,
             success: true,
+            threadId,
         });
 
         // Trim old records
-        while (recentExecutions.length > MAX_RECENT) {
-            recentExecutions.shift();
+        while (threadStats.recentExecutions.length > MAX_RECENT) {
+            threadStats.recentExecutions.shift();
         }
 
         if (logToConsole) {
             logger.info(`[Tool] Completed: ${input.tool} (${formatDuration(input.duration)})`);
         }
 
-        updateStatusBar();
+        // Only update status bar if this is the current thread
+        if (threadId === currentThreadId) {
+            updateStatusBar();
+        }
     });
 
     // Track tool errors
     const onErrorDisposable = events.on('tool.onError', (input, output) => {
         const { logToConsole } = getSettings();
-        const stats = getStats(input.tool);
+        const threadId = input.context.threadId;
+        const stats = getToolStats(threadId, input.tool);
+        const threadStats = getThreadStats(threadId);
 
         stats.calls++;
         stats.failures++;
@@ -185,17 +238,18 @@ export async function activate(context: PluginContext): Promise<PluginActivation
         stats.lastError = input.error.message;
 
         // Record execution
-        recentExecutions.push({
+        threadStats.recentExecutions.push({
             tool: input.tool,
             timestamp: Date.now(),
             duration: input.duration,
             success: false,
             error: input.error.message,
+            threadId,
         });
 
         // Trim old records
-        while (recentExecutions.length > MAX_RECENT) {
-            recentExecutions.shift();
+        while (threadStats.recentExecutions.length > MAX_RECENT) {
+            threadStats.recentExecutions.shift();
         }
 
         if (logToConsole) {
@@ -207,15 +261,19 @@ export async function activate(context: PluginContext): Promise<PluginActivation
         // Show notification for failures
         ui.showWarning(`Tool "${input.tool}" failed: ${input.error.message}`);
 
-        updateStatusBar();
+        // Only update status bar if this is the current thread
+        if (threadId === currentThreadId) {
+            updateStatusBar();
+        }
     });
 
     // Command: Show detailed statistics
     const showStatsDisposable = commands.register('toolMonitor.showStats', async () => {
+        const threadStats = getCurrentThreadStats();
         const { totalCalls, totalSuccesses, totalFailures, totalTime } = getTotals();
 
         if (totalCalls === 0) {
-            ui.showNotification('No tools have been executed yet.', { type: 'info' });
+            ui.showNotification('No tools have been executed in this thread yet.', { type: 'info' });
             return;
         }
 
@@ -225,7 +283,7 @@ export async function activate(context: PluginContext): Promise<PluginActivation
             : '0.0';
 
         const lines = [
-            '═══ Tool Monitor Statistics ═══',
+            '═══ Tool Monitor Statistics (Current Thread) ═══',
             '',
             `Total Executions: ${totalCalls}`,
             `Successful: ${totalSuccesses} (${successRate}%)`,
@@ -237,33 +295,35 @@ export async function activate(context: PluginContext): Promise<PluginActivation
             '',
         ];
 
-        const sortedTools = Array.from(toolStats.entries())
-            .sort((a, b) => b[1].calls - a[1].calls);
+        if (threadStats) {
+            const sortedTools = Array.from(threadStats.toolStats.entries())
+                .sort((a, b) => b[1].calls - a[1].calls);
 
-        for (const [tool, stats] of sortedTools) {
-            const toolAvgTime = stats.calls > 0 ? stats.totalTime / stats.calls : 0;
-            const toolSuccessRate = stats.calls > 0
-                ? ((stats.successes / stats.calls) * 100).toFixed(0)
-                : '0';
+            for (const [tool, stats] of sortedTools) {
+                const toolAvgTime = stats.calls > 0 ? stats.totalTime / stats.calls : 0;
+                const toolSuccessRate = stats.calls > 0
+                    ? ((stats.successes / stats.calls) * 100).toFixed(0)
+                    : '0';
 
-            lines.push(`${tool}:`);
-            lines.push(`  Calls: ${stats.calls} | Success: ${toolSuccessRate}% | Avg: ${formatDuration(toolAvgTime)}`);
+                lines.push(`${tool}:`);
+                lines.push(`  Calls: ${stats.calls} | Success: ${toolSuccessRate}% | Avg: ${formatDuration(toolAvgTime)}`);
 
-            if (stats.lastError) {
-                lines.push(`  Last error: ${stats.lastError.slice(0, 50)}${stats.lastError.length > 50 ? '...' : ''}`);
+                if (stats.lastError) {
+                    lines.push(`  Last error: ${stats.lastError.slice(0, 50)}${stats.lastError.length > 50 ? '...' : ''}`);
+                }
             }
-        }
 
-        // Show recent failures
-        const recentFailures = recentExecutions
-            .filter(r => !r.success)
-            .slice(-5);
+            // Show recent failures
+            const recentFailures = threadStats.recentExecutions
+                .filter(r => !r.success)
+                .slice(-5);
 
-        if (recentFailures.length > 0) {
-            lines.push('', '─── Recent Failures ───', '');
-            for (const record of recentFailures) {
-                const time = new Date(record.timestamp).toLocaleTimeString();
-                lines.push(`[${time}] ${record.tool}: ${record.error?.slice(0, 40) || 'Unknown error'}`);
+            if (recentFailures.length > 0) {
+                lines.push('', '─── Recent Failures ───', '');
+                for (const record of recentFailures) {
+                    const time = new Date(record.timestamp).toLocaleTimeString();
+                    lines.push(`[${time}] ${record.tool}: ${record.error?.slice(0, 40) || 'Unknown error'}`);
+                }
             }
         }
 
@@ -275,9 +335,14 @@ export async function activate(context: PluginContext): Promise<PluginActivation
                 value: 'view'
             },
             {
-                label: 'Reset Statistics',
-                description: 'Clear all tracked data',
+                label: 'Reset Current Thread',
+                description: 'Clear stats for this thread',
                 value: 'reset'
+            },
+            {
+                label: 'Reset All Threads',
+                description: 'Clear all tracked data',
+                value: 'reset-all'
             },
             {
                 label: 'Close',
@@ -290,22 +355,43 @@ export async function activate(context: PluginContext): Promise<PluginActivation
             ui.showNotification(lines.join('\n'), { duration: 0 });
         } else if (action === 'reset') {
             await commands.execute('toolMonitor.reset');
+        } else if (action === 'reset-all') {
+            await commands.execute('toolMonitor.resetAll');
         }
     });
 
-    // Command: Reset statistics
+    // Command: Reset current thread statistics
     const resetDisposable = commands.register('toolMonitor.reset', async () => {
+        if (!currentThreadId) {
+            ui.showNotification('No thread selected', { type: 'warning' });
+            return;
+        }
+
         const confirmed = await ui.showConfirmDialog(
-            'Reset all tool statistics?',
+            'Reset tool statistics for current thread?',
             { type: 'warning', confirmLabel: 'Reset' }
         );
 
         if (confirmed) {
-            toolStats.clear();
-            recentExecutions.length = 0;
+            threadStatsMap.delete(currentThreadId);
             updateStatusBar();
-            ui.showNotification('Tool statistics reset', { type: 'success' });
-            logger.info('Tool statistics reset');
+            ui.showNotification('Thread statistics reset', { type: 'success' });
+            logger.info(`Tool statistics reset for thread: ${currentThreadId}`);
+        }
+    });
+
+    // Command: Reset all statistics
+    const resetAllDisposable = commands.register('toolMonitor.resetAll', async () => {
+        const confirmed = await ui.showConfirmDialog(
+            'Reset tool statistics for ALL threads?',
+            { type: 'warning', confirmLabel: 'Reset All' }
+        );
+
+        if (confirmed) {
+            threadStatsMap.clear();
+            updateStatusBar();
+            ui.showNotification('All statistics reset', { type: 'success' });
+            logger.info('All tool statistics reset');
         }
     });
 
@@ -323,11 +409,13 @@ export async function activate(context: PluginContext): Promise<PluginActivation
     return {
         dispose: () => {
             logger.info('Tool Monitor plugin deactivated');
+            threadActivatedDisposable.dispose();
             willExecuteDisposable.dispose();
             didExecuteDisposable.dispose();
             onErrorDisposable.dispose();
             showStatsDisposable.dispose();
             resetDisposable.dispose();
+            resetAllDisposable.dispose();
             settingsDisposable.dispose();
             statusItem.dispose();
         },
