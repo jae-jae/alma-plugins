@@ -1,4 +1,4 @@
-import type { PluginContext, PluginActivation, StatusBarItem } from 'alma-plugin-api';
+import type { PluginContext, PluginActivation } from 'alma-plugin-api';
 
 /**
  * Token Counter Plugin
@@ -14,12 +14,13 @@ interface TokenStats {
 }
 
 export async function activate(context: PluginContext): Promise<PluginActivation> {
-    const { logger, hooks, ui, settings } = context;
+    const { logger, events, ui, settings } = context;
 
     logger.info('Token Counter plugin activated!');
 
     // Create status bar item
-    const statusBarItem: StatusBarItem = ui.createStatusBarItem({
+    const statusBarItem = ui.createStatusBarItem({
+        id: 'token-counter',
         alignment: 'right',
         priority: 100,
     });
@@ -61,21 +62,17 @@ export async function activate(context: PluginContext): Promise<PluginActivation
         return num.toLocaleString();
     };
 
-    // Register hook to track message responses
-    const hookDisposable = hooks.register(
-        'chat.message.didReceive',
-        (input, _output) => {
-            if (input.response.usage) {
-                sessionStats.promptTokens += input.response.usage.promptTokens;
-                sessionStats.completionTokens += input.response.usage.completionTokens;
-                sessionStats.totalTokens += input.response.usage.totalTokens;
+    // Subscribe to message receive events to track token usage
+    const eventDisposable = events.on('chat.message.didReceive', (input, _output) => {
+        if (input.response.usage) {
+            sessionStats.promptTokens += input.response.usage.promptTokens;
+            sessionStats.completionTokens += input.response.usage.completionTokens;
+            sessionStats.totalTokens += input.response.usage.totalTokens;
 
-                logger.debug(`Token usage updated: ${JSON.stringify(sessionStats)}`);
-                updateStatusBar();
-            }
-        },
-        { priority: 10 }
-    );
+            logger.debug(`Token usage updated: ${JSON.stringify(sessionStats)}`);
+            updateStatusBar();
+        }
+    });
 
     // Initialize the status bar
     updateStatusBar();
@@ -89,7 +86,7 @@ export async function activate(context: PluginContext): Promise<PluginActivation
     return {
         dispose: () => {
             logger.info('Token Counter plugin deactivated');
-            hookDisposable.dispose();
+            eventDisposable.dispose();
             settingsDisposable.dispose();
             statusBarItem.dispose();
         },

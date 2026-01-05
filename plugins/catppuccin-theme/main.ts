@@ -100,8 +100,8 @@ export async function activate(context: PluginContext): Promise<PluginActivation
     };
 
     // Listen for settings changes
-    const settingsDisposable = settings.onDidChange((key) => {
-        if (key === 'catppuccin.accentColor') {
+    const settingsDisposable = settings.onDidChange((event) => {
+        if (event.key === 'catppuccin.accentColor') {
             updateAccentColor();
         }
     });

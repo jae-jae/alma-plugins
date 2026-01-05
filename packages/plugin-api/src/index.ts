@@ -2,10 +2,12 @@
  * Alma Plugin API
  *
  * TypeScript type definitions for developing Alma plugins.
- * These types are provided by the Alma runtime when plugins are loaded.
+ * These types match the runtime API provided by Alma.
  *
  * @packageDocumentation
  */
+
+import type { z } from 'zod';
 
 // ============================================================================
 // Core Types
@@ -25,6 +27,18 @@ export interface PluginActivation {
     dispose(): void;
 }
 
+/**
+ * Event callback type.
+ */
+export type EventCallback<T> = (data: T) => void;
+
+/**
+ * Event subscription function.
+ */
+export interface Event<T> {
+    (listener: EventCallback<T>): Disposable;
+}
+
 // ============================================================================
 // Logger API
 // ============================================================================
@@ -40,28 +54,58 @@ export interface Logger {
 }
 
 // ============================================================================
+// Storage API
+// ============================================================================
+
+/**
+ * Persistent key-value storage for plugins.
+ */
+export interface Storage {
+    get<T>(key: string): Promise<T | undefined>;
+    get<T>(key: string, defaultValue: T): Promise<T>;
+    set(key: string, value: unknown): Promise<void>;
+    delete(key: string): Promise<void>;
+    keys(): Promise<string[]>;
+    clear(): Promise<void>;
+}
+
+/**
+ * Secure storage for sensitive data like API keys.
+ */
+export interface SecretStorage {
+    get(key: string): Promise<string | undefined>;
+    set(key: string, value: string): Promise<void>;
+    delete(key: string): Promise<void>;
+}
+
+// ============================================================================
 // Tools API
 // ============================================================================
 
 /**
- * Definition for a tool that can be used by the AI assistant.
+ * Context passed to tool execution.
  */
-export interface ToolDefinition {
-    name: string;
+export interface ToolContext {
+    threadId: string;
+    messageId: string;
+    abortSignal?: AbortSignal;
+}
+
+/**
+ * Definition for a tool that can be used by the AI assistant.
+ * Uses Zod schema for parameter validation.
+ */
+export interface ToolDefinition<TParams extends z.ZodType = z.ZodType> {
     description: string;
-    parameters: {
-        type: 'object';
-        properties: Record<string, unknown>;
-        required?: string[];
-    };
-    execute: (args: unknown) => Promise<unknown>;
+    parameters: TParams;
+    execute: (params: z.infer<TParams>, context: ToolContext) => Promise<unknown>;
 }
 
 /**
  * API for registering and managing AI tools.
  */
 export interface ToolsAPI {
-    register(id: string, tool: ToolDefinition): Disposable;
+    register<TParams extends z.ZodType>(id: string, definition: ToolDefinition<TParams>): Disposable;
     unregister(id: string): void;
 }
 
@@ -73,30 +117,66 @@ export interface ToolsAPI {
  * API for registering command palette commands.
  */
 export interface CommandsAPI {
-    register(id: string, handler: () => Promise<void> | void): Disposable;
-    execute(id: string, ...args: unknown[]): Promise<void>;
+    register(id: string, handler: (...args: unknown[]) => Promise<unknown> | unknown): Disposable;
+    execute<T>(id: string, ...args: unknown[]): Promise<T>;
 }
 
 // ============================================================================
-// Hooks API
+// Events API (Hooks)
 // ============================================================================
 
 /**
- * Options for hook registration.
+ * Available hook names for event subscriptions.
  */
-export interface HookOptions {
-    priority?: number;
-}
+export type HookName =
+    | 'chat.message.willSend'
+    | 'chat.message.didSend'
+    | 'chat.message.didReceive'
+    | 'chat.thread.created'
+    | 'chat.thread.deleted'
+    | 'tool.willExecute'
+    | 'tool.didExecute'
+    | 'app.ready'
+    | 'app.willQuit';
+
+/**
+ * Hook handler function type.
+ */
+export type HookHandler<T extends HookName> = (
+    input: HookInput<T>,
+    output: HookOutput<T>
+) => void | Promise<void>;
+
+/**
+ * Hook input types based on hook name.
+ */
+export type HookInput<T extends HookName> = T extends 'chat.message.willSend'
+    ? { threadId: string; content: string; model: string }
+    : T extends 'chat.message.didReceive'
+      ? { threadId: string; response: { content: string; usage?: { promptTokens: number; completionTokens: number; totalTokens: number } } }
+      : T extends 'chat.thread.created'
+        ? { threadId: string; title: string }
+        : T extends 'tool.willExecute'
+          ? { toolId: string; params: unknown }
+          : T extends 'tool.didExecute'
+            ? { toolId: string; result: unknown }
+            : unknown;
+
+/**
+ * Hook output types based on hook name.
+ */
+export type HookOutput<T extends HookName> = T extends 'chat.message.willSend'
+    ? { content?: string; cancel?: boolean }
+    : T extends 'tool.willExecute'
+      ? { params?: unknown; cancel?: boolean }
+      : Record<string, unknown>;
 
 /**
  * API for subscribing to lifecycle events.
  */
-export interface HooksAPI {
-    register<TInput, TOutput>(
-        hookName: string,
-        handler: (input: TInput, output: TOutput) => void | Promise<void>,
-        options?: HookOptions
-    ): Disposable;
+export interface EventsAPI {
+    on<T extends HookName>(hookName: T, handler: HookHandler<T>, options?: { priority?: number }): Disposable;
+    once<T extends HookName>(hookName: T, handler: HookHandler<T>): Disposable;
 }
 
 // ============================================================================
@@ -109,37 +189,104 @@ export interface HooksAPI {
 export interface NotificationOptions {
     type?: 'info' | 'success' | 'warning' | 'error';
     duration?: number;
+    action?: {
+        label: string;
+        callback: () => void;
+    };
 }
+
+/**
+ * Quick pick item for selection dialogs.
+ */
+export interface QuickPickItem<T = string> {
+    label: string;
+    description?: string;
+    detail?: string;
+    value: T;
+}
+
+/**
+ * Options for quick pick dialogs.
+ */
+export interface QuickPickOptions {
+    title?: string;
+    placeholder?: string;
+    canSelectMany?: boolean;
+}
+
+/**
+ * Options for input box dialogs.
+ */
+export interface InputBoxOptions {
+    title?: string;
+    prompt?: string;
+    placeholder?: string;
+    value?: string;
+    password?: boolean;
+    validateInput?: (value: string) => string | undefined;
+}
+
+/**
+ * Options for confirm dialogs.
+ */
+export interface ConfirmOptions {
+    title?: string;
+    confirmLabel?: string;
+    cancelLabel?: string;
+    type?: 'info' | 'warning' | 'danger';
+}
+
+/**
+ * Options for progress indicators.
+ */
+export interface ProgressOptions {
+    title: string;
+    cancellable?: boolean;
+}
+
+/**
+ * Progress report for updating progress indicators.
+ */
+export interface ProgressReport {
+    increment?: number;
+    message?: string;
+}
+
+/**
+ * Progress task function type.
+ */
+export type ProgressTask<T> = (
+    progress: { report: (value: ProgressReport) => void },
+    token: { isCancellationRequested: boolean }
+) => Promise<T>;
 
 /**
  * A status bar item that can display information.
  */
-export interface StatusBarItem {
-    id: string;
+export interface StatusBarItem extends Disposable {
     text: string;
     tooltip?: string;
     command?: string;
-    alignment: 'left' | 'right';
-    priority: number;
     show(): void;
     hide(): void;
-    dispose(): void;
 }
 
 /**
  * Options for creating a status bar item.
  */
 export interface StatusBarItemOptions {
-    id?: string;
-    alignment?: 'left' | 'right';
+    id: string;
+    alignment: 'left' | 'right';
     priority?: number;
 }
 
 /**
- * Theme change event handler.
+ * Theme definition.
  */
-export interface ThemeChangeHandler {
-    onChange(callback: (theme: Theme) => void): Disposable;
+export interface Theme {
+    id: string;
+    name: string;
+    type: 'dark' | 'light';
 }
 
 /**
@@ -147,23 +294,17 @@ export interface ThemeChangeHandler {
  */
 export interface UIAPI {
     showNotification(message: string, options?: NotificationOptions): void;
-    createStatusBarItem(options?: StatusBarItemOptions): StatusBarItem;
-    theme: ThemeChangeHandler;
-}
-
-// ============================================================================
-// Settings API
-// ============================================================================
-
-/**
- * API for reading and writing plugin settings.
- */
-export interface SettingsAPI {
-    get<T>(key: string): T | undefined;
-    get<T>(key: string, defaultValue: T): T;
-    set(key: string, value: unknown): Promise<void>;
-    onChange(key: string, callback: (value: unknown) => void): Disposable;
-    onDidChange(callback: (key?: string) => void): Disposable;
+    showError(message: string): void;
+    showWarning(message: string): void;
+    showQuickPick<T>(items: QuickPickItem<T>[], options?: QuickPickOptions): Promise<T | undefined>;
+    showInputBox(options?: InputBoxOptions): Promise<string | undefined>;
+    showConfirmDialog(message: string, options?: ConfirmOptions): Promise<boolean>;
+    withProgress<T>(options: ProgressOptions, task: ProgressTask<T>): Promise<T>;
+    createStatusBarItem(options: StatusBarItemOptions): StatusBarItem;
+    readonly theme: {
+        current: Theme;
+        onChange: Event<Theme>;
+    };
 }
 
 // ============================================================================
@@ -173,9 +314,8 @@ export interface SettingsAPI {
 /**
  * A chat message.
  */
-export interface ChatMessage {
+export interface Message {
     id: string;
-    threadId: string;
     role: 'user' | 'assistant' | 'system';
     content: string;
     createdAt: string;
@@ -184,9 +324,10 @@ export interface ChatMessage {
 /**
  * A chat thread/conversation.
  */
-export interface ChatThread {
+export interface Thread {
     id: string;
     title: string;
+    model?: string;
     createdAt: string;
     updatedAt: string;
 }
@@ -195,96 +336,134 @@ export interface ChatThread {
  * API for accessing chat threads and messages.
  */
 export interface ChatAPI {
-    onMessage(callback: (message: ChatMessage) => void): Disposable;
-    getMessages(threadId: string): Promise<ChatMessage[]>;
-    getCurrentThread(): Promise<ChatThread | null>;
+    getThread(id: string): Promise<Thread | undefined>;
+    getActiveThread(): Promise<Thread | undefined>;
+    createThread(options?: { title?: string; model?: string }): Promise<Thread>;
+    getMessages(threadId: string): Promise<Message[]>;
 }
 
 // ============================================================================
-// Transform API
+// Provider API
 // ============================================================================
 
 /**
- * API for transforming messages and prompts.
+ * AI provider information.
  */
-export interface TransformAPI {
-    registerSystemPrompt(
-        id: string,
-        transformer: (prompt: string) => string | Promise<string>
-    ): Disposable;
-    registerUserMessage(
-        id: string,
-        transformer: (message: string) => string | Promise<string>
-    ): Disposable;
-}
-
-// ============================================================================
-// Theme API
-// ============================================================================
-
-/**
- * Color definitions for a theme.
- */
-export interface ThemeColors {
-    background: string;
-    foreground: string;
-    primary: string;
-    secondary?: string;
-    accent?: string;
-    muted?: string;
-    border?: string;
-    error?: string;
-    warning?: string;
-    success?: string;
-    info?: string;
-    [key: string]: string | undefined;
-}
-
-/**
- * A theme definition.
- */
-export interface Theme {
+export interface Provider {
     id: string;
-    label: string;
-    type: 'dark' | 'light';
-    colors: ThemeColors;
+    name: string;
+    type: string;
+    enabled: boolean;
 }
 
 /**
- * API for registering and managing themes.
+ * Provider definition for registering custom providers.
  */
-export interface ThemesAPI {
-    register(theme: Theme): Disposable;
-    getCurrent(): Theme | null;
-    apply(themeId: string): Promise<void>;
+export interface ProviderDefinition {
+    id: string;
+    name: string;
+    icon?: string;
+    getModels(): Promise<Array<{ id: string; name: string }>>;
+    createChatCompletion(request: {
+        model: string;
+        messages: Message[];
+        stream?: boolean;
+    }): Promise<ReadableStream | { content: string }>;
+}
+
+/**
+ * API for managing AI providers.
+ */
+export interface ProvidersAPI {
+    list(): Promise<Provider[]>;
+    get(id: string): Promise<Provider | undefined>;
+    register(provider: ProviderDefinition): Disposable;
 }
 
 // ============================================================================
-// Storage API
+// Workspace API
 // ============================================================================
 
 /**
- * Persistent key-value storage for plugins.
+ * File statistics.
  */
-export interface StorageAPI {
+export interface FileStat {
+    type: 'file' | 'directory' | 'symlink';
+    size: number;
+    mtime: number;
+    ctime: number;
+}
+
+/**
+ * File type.
+ */
+export type FileType = 'file' | 'directory' | 'symlink' | 'unknown';
+
+/**
+ * Workspace folder.
+ */
+export interface WorkspaceFolder {
+    id: string;
+    path: string;
+    name: string;
+}
+
+/**
+ * File system watcher.
+ */
+export interface FileSystemWatcher extends Disposable {
+    onDidCreate: Event<string>;
+    onDidChange: Event<string>;
+    onDidDelete: Event<string>;
+}
+
+/**
+ * API for workspace and file system operations.
+ */
+export interface WorkspaceAPI {
+    readonly rootPath: string | undefined;
+    readonly workspaceFolders: WorkspaceFolder[];
+    readFile(filePath: string): Promise<Uint8Array>;
+    writeFile(filePath: string, content: Uint8Array): Promise<void>;
+    stat(filePath: string): Promise<FileStat>;
+    readDirectory(dirPath: string): Promise<[string, FileType][]>;
+    createFileSystemWatcher(pattern: string): FileSystemWatcher;
+}
+
+// ============================================================================
+// Settings API
+// ============================================================================
+
+/**
+ * Settings change event.
+ */
+export interface SettingsChangeEvent {
+    key: string;
+    oldValue: unknown;
+    newValue: unknown;
+}
+
+/**
+ * API for reading and writing plugin settings.
+ */
+export interface SettingsAPI {
     get<T>(key: string): T | undefined;
     get<T>(key: string, defaultValue: T): T;
-    set(key: string, value: unknown): Promise<void>;
-    delete(key: string): Promise<void>;
-    keys(): string[];
+    update(key: string, value: unknown): Promise<void>;
+    onDidChange: Event<SettingsChangeEvent>;
 }
 
 // ============================================================================
-// Secrets API
+// i18n API
 // ============================================================================
 
 /**
- * Secure storage for sensitive data like API keys.
+ * Internationalization API.
  */
-export interface SecretsAPI {
-    get(key: string): Promise<string | undefined>;
-    set(key: string, value: string): Promise<void>;
-    delete(key: string): Promise<void>;
+export interface I18nAPI {
+    t(key: string, params?: Record<string, unknown>): string;
+    locale: string;
+    onDidChangeLocale: Event<string>;
 }
 
 // ============================================================================
@@ -296,26 +475,48 @@ export interface SecretsAPI {
  * Provides access to all Alma APIs.
  */
 export interface PluginContext {
-    // Core APIs
-    logger: Logger;
-    tools: ToolsAPI;
-    commands: CommandsAPI;
-    hooks: HooksAPI;
-    ui: UIAPI;
-    settings: SettingsAPI;
-    chat: ChatAPI;
-    transform: TransformAPI;
-    themes: ThemesAPI;
-    storage: StorageAPI;
-    secrets: SecretsAPI;
-
     // Plugin info
-    pluginId: string;
-    pluginPath: string;
+    readonly id: string;
+    readonly extensionPath: string;
+    readonly storagePath: string;
+    readonly globalStoragePath: string;
 
-    // Extension state storage
-    globalState: Map<string, unknown>;
-    workspaceState: Map<string, unknown>;
+    // Logging
+    readonly logger: Logger;
+
+    // Storage APIs
+    readonly storage: {
+        local: Storage;
+        workspace: Storage;
+        secrets: SecretStorage;
+    };
+
+    // Tool registration
+    readonly tools: ToolsAPI;
+
+    // Command registration
+    readonly commands: CommandsAPI;
+
+    // Event system (hooks)
+    readonly events: EventsAPI;
+
+    // UI APIs
+    readonly ui: UIAPI;
+
+    // Chat APIs
+    readonly chat: ChatAPI;
+
+    // Provider APIs
+    readonly providers: ProvidersAPI;
+
+    // Workspace APIs
+    readonly workspace: WorkspaceAPI;
+
+    // Settings APIs
+    readonly settings: SettingsAPI;
+
+    // i18n
+    readonly i18n: I18nAPI;
 }
 
 // ============================================================================
@@ -332,8 +533,20 @@ export interface PluginContext {
  * export async function activate(context: PluginContext): Promise<PluginActivation> {
  *     context.logger.info('Plugin activated!');
  *
+ *     // Register a command
+ *     const commandDisposable = context.commands.register('myCommand', () => {
+ *         context.ui.showNotification('Hello!');
+ *     });
+ *
+ *     // Subscribe to events
+ *     const eventDisposable = context.events.on('chat.message.didReceive', (input) => {
+ *         context.logger.info('Message received:', input.response.content);
+ *     });
+ *
  *     return {
  *         dispose: () => {
+ *             commandDisposable.dispose();
+ *             eventDisposable.dispose();
  *             context.logger.info('Plugin deactivated');
  *         }
  *     };

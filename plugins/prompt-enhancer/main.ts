@@ -49,7 +49,7 @@ Please provide clear, concise responses.
 };
 
 export async function activate(context: PluginContext): Promise<PluginActivation> {
-    const { logger, hooks, settings, commands, ui } = context;
+    const { logger, events, settings, commands, ui } = context;
 
     logger.info('Prompt Enhancer plugin activated!');
 
@@ -86,9 +86,9 @@ export async function activate(context: PluginContext): Promise<PluginActivation
         return parts.join('\n');
     };
 
-    // Register hook to transform system prompt
-    const hookDisposable = hooks.register(
-        'chat.system.transform',
+    // Subscribe to message will send event to enhance the prompt
+    const eventDisposable = events.on(
+        'chat.message.willSend',
         (input, output) => {
             const config = getSettings();
 
@@ -98,19 +98,19 @@ export async function activate(context: PluginContext): Promise<PluginActivation
             }
 
             const enhancement = buildEnhancement();
-            const enhancedPrompt = `${input.systemPrompt}\n\n${enhancement}`;
+            const enhancedContent = `${input.content}\n\n${enhancement}`;
 
-            output.systemPrompt = enhancedPrompt;
+            output.content = enhancedContent;
 
-            logger.debug(`Enhanced system prompt for model ${input.model}`);
+            logger.debug(`Enhanced message for model ${input.model}`);
         },
         { priority: 50 } // Medium priority to allow other plugins to override
     );
 
     // Register toggle command
-    const commandDisposable = commands.register('prompt-enhancer.toggle', async () => {
+    const commandDisposable = commands.register('toggle', async () => {
         const current = settings.get<boolean>('promptEnhancer.enabled', true);
-        await settings.set('promptEnhancer.enabled', !current);
+        await settings.update('promptEnhancer.enabled', !current);
 
         const status = !current ? 'enabled' : 'disabled';
         ui.showNotification(`Prompt enhancement ${status}`, {
@@ -121,7 +121,7 @@ export async function activate(context: PluginContext): Promise<PluginActivation
     return {
         dispose: () => {
             logger.info('Prompt Enhancer plugin deactivated');
-            hookDisposable.dispose();
+            eventDisposable.dispose();
             commandDisposable.dispose();
         },
     };

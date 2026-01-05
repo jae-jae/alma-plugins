@@ -107,19 +107,42 @@ my-plugin/
 ### Plugin Entry Point
 
 ```typescript
+import { z } from 'zod';
 import type { PluginContext, PluginActivation } from 'alma-plugin-api';
 
 export async function activate(context: PluginContext): Promise<PluginActivation> {
-    const { logger, tools, commands, hooks, ui, settings } = context;
+    const { logger, tools, commands, events, ui, settings } = context;
 
     logger.info('Plugin activated!');
 
-    // Register tools, commands, hooks, etc.
+    // Register a tool with Zod schema for parameters
+    const toolDisposable = tools.register('myTool', {
+        description: 'A description of what the tool does',
+        parameters: z.object({
+            input: z.string().describe('The input parameter'),
+        }),
+        execute: async (params, toolContext) => {
+            logger.info(`Executing with input: ${params.input}`);
+            return { result: 'success' };
+        },
+    });
+
+    // Register a command
+    const commandDisposable = commands.register('myCommand', async () => {
+        ui.showNotification('Hello from my plugin!', { type: 'info' });
+    });
+
+    // Subscribe to events
+    const eventDisposable = events.on('chat.message.didReceive', (input, output) => {
+        logger.info('Message received:', input.response.content);
+    });
 
     return {
         dispose: () => {
             logger.info('Plugin deactivated');
-            // Clean up resources
+            toolDisposable.dispose();
+            commandDisposable.dispose();
+            eventDisposable.dispose();
         },
     };
 }
@@ -131,34 +154,35 @@ export async function activate(context: PluginContext): Promise<PluginActivation
 
 | Property | Description |
 |----------|-------------|
+| `id` | Plugin ID |
+| `extensionPath` | Path to the plugin directory |
+| `storagePath` | Path for plugin-specific storage |
+| `globalStoragePath` | Path for global plugin storage |
 | `logger` | Logging utilities (info, warn, error, debug) |
-| `tools` | Register and manage AI tools |
+| `storage` | Persistent key-value storage (local, workspace, secrets) |
+| `tools` | Register AI tools with Zod schemas |
 | `commands` | Register command palette commands |
-| `hooks` | Subscribe to lifecycle events |
+| `events` | Subscribe to lifecycle events |
 | `ui` | UI utilities (notifications, status bar, dialogs) |
-| `settings` | Read and write plugin settings |
-| `storage` | Persistent key-value storage |
-| `secrets` | Secure storage for sensitive data |
 | `chat` | Access to chat threads and messages |
 | `providers` | Access to AI providers |
 | `workspace` | File system access (with permissions) |
+| `settings` | Read and write plugin settings |
 | `i18n` | Internationalization utilities |
 
-### Available Hooks
+### Available Events
 
-| Hook | Description |
-|------|-------------|
+| Event | Description |
+|-------|-------------|
 | `chat.message.willSend` | Before a message is sent |
+| `chat.message.didSend` | After a message is sent |
 | `chat.message.didReceive` | After a response is received |
-| `chat.system.transform` | Transform the system prompt |
-| `chat.params.transform` | Transform model parameters |
+| `chat.thread.created` | When a new thread is created |
+| `chat.thread.deleted` | When a thread is deleted |
 | `tool.willExecute` | Before a tool is executed |
 | `tool.didExecute` | After a tool completes |
-| `tool.onError` | When a tool errors |
 | `app.ready` | When the application starts |
 | `app.willQuit` | Before the application quits |
-| `thread.created` | When a new thread is created |
-| `thread.deleted` | When a thread is deleted |
 
 ## Permissions
 
@@ -192,11 +216,12 @@ Plugins must declare required permissions in their manifest:
 
 2. Restart Alma or use the "Refresh" button in Settings > Plugins
 
-### From NPM (Coming Soon)
+### From Marketplace
 
-```bash
-alma plugin install <package-name>
-```
+1. Open Alma Settings > Plugins
+2. Switch to the "Marketplace" tab
+3. Search for the plugin you want
+4. Click "Install"
 
 ## Development
 
@@ -210,7 +235,7 @@ alma plugin install <package-name>
 
 ```bash
 npm init -y
-npm install -D typescript alma-plugin-api
+npm install -D typescript alma-plugin-api zod
 npx tsc --init
 ```
 

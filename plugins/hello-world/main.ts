@@ -1,3 +1,4 @@
+import { z } from 'zod';
 import type { PluginContext, PluginActivation } from 'alma-plugin-api';
 
 /**
@@ -7,33 +8,26 @@ import type { PluginContext, PluginActivation } from 'alma-plugin-api';
  * of an Alma plugin. It registers a tool and a command that greet the user.
  */
 
+// Define the parameter schema using Zod
+const greetParamsSchema = z.object({
+    name: z.string().describe('The name of the person to greet'),
+    language: z
+        .enum(['en', 'zh', 'ja', 'es', 'fr'])
+        .default('en')
+        .describe('The language to use for the greeting'),
+});
+
 export async function activate(context: PluginContext): Promise<PluginActivation> {
     const { logger, tools, commands, ui } = context;
 
     logger.info('Hello World plugin activated!');
 
     // Register a tool that can be used by the AI assistant
-    const toolDisposable = tools.register('hello-world.greet', {
-        name: 'Greet',
+    const toolDisposable = tools.register('greet', {
         description: 'Say hello to the user with a personalized message',
-        parameters: {
-            type: 'object',
-            properties: {
-                name: {
-                    type: 'string',
-                    description: 'The name of the person to greet',
-                },
-                language: {
-                    type: 'string',
-                    enum: ['en', 'zh', 'ja', 'es', 'fr'],
-                    description: 'The language to use for the greeting',
-                    default: 'en',
-                },
-            },
-            required: ['name'],
-        },
-        execute: async (args) => {
-            const { name, language = 'en' } = args as { name: string; language?: string };
+        parameters: greetParamsSchema,
+        execute: async (params, _toolContext) => {
+            const { name, language } = params;
 
             const greetings: Record<string, string> = {
                 en: `Hello, ${name}! Welcome to Alma!`,
@@ -55,7 +49,7 @@ export async function activate(context: PluginContext): Promise<PluginActivation
     });
 
     // Register a command that can be triggered from the command palette
-    const commandDisposable = commands.register('hello-world.sayHello', async () => {
+    const commandDisposable = commands.register('sayHello', async () => {
         ui.showNotification('Hello from the Hello World plugin!', {
             type: 'info',
         });
