@@ -18,6 +18,8 @@ import type { PluginContext, PluginActivation } from 'alma-plugin-api';
 import { TokenStore } from './lib/token-store';
 import { getAuthorizationUrl, exchangeCodeForTokens } from './lib/auth';
 import { CODEX_MODELS, getBaseModelId, getReasoningEffort } from './lib/models';
+import { getCodexInstructions } from './lib/codex-instructions';
+import { filterAlmaSystemPrompts, addAlmaBridgeMessage } from './lib/alma-codex-bridge';
 
 // ============================================================================
 // Constants (matching opencode-openai-codex-auth)
@@ -262,7 +264,11 @@ export async function activate(context: PluginContext): Promise<PluginActivation
                     // 1. Remove item_reference types (AI SDK construct not supported by Codex)
                     // 2. Strip IDs from all items (required for stateless mode with store=false)
                     // 3. Normalize orphaned tool outputs to messages (prevent infinite loops)
+                    // 4. Filter Alma system prompts (replaced by Codex instructions)
+                    // 5. Add Alma-Codex bridge message when tools are present
                     let filteredInput = parsed.input || parsed.messages;
+                    const hasTools = !!parsed.tools && parsed.tools.length > 0;
+
                     if (Array.isArray(filteredInput)) {
                         filteredInput = filteredInput
                             .filter((item: any) => {
@@ -284,7 +290,19 @@ export async function activate(context: PluginContext): Promise<PluginActivation
                         // Handle orphaned tool outputs (matching opencode's normalizeOrphanedToolOutputs)
                         // This converts orphaned function_call_output items to messages to preserve context
                         filteredInput = normalizeOrphanedToolOutputs(filteredInput);
+
+                        // Filter Alma system prompts (matching opencode's filterOpenCodeSystemPrompts)
+                        // These are replaced by Codex instructions
+                        filteredInput = filterAlmaSystemPrompts(filteredInput);
+
+                        // Add Alma-Codex bridge message when tools are present (matching opencode's addCodexBridgeMessage)
+                        // This maps Codex tool names (apply_patch, update_plan) to Alma tool names (Edit, TodoWrite)
+                        filteredInput = addAlmaBridgeMessage(filteredInput, hasTools);
                     }
+
+                    // Fetch Codex instructions from GitHub (matching opencode)
+                    // These are cached with ETag for 15 minutes
+                    const codexInstructions = await getCodexInstructions(normalizedModel);
 
                     // Transform to Codex format (matching opencode's transformRequestBody)
                     const transformedBody: Record<string, any> = {
@@ -298,11 +316,9 @@ export async function activate(context: PluginContext): Promise<PluginActivation
                         },
                     };
 
-                    // Preserve instructions field if present (matching opencode)
-                    // opencode sets body.instructions = codexInstructions from GitHub
-                    // For Alma, we preserve any instructions passed through the request
-                    if (parsed.instructions) {
-                        transformedBody.instructions = parsed.instructions;
+                    // Set Codex instructions (matching opencode's body.instructions = codexInstructions)
+                    if (codexInstructions) {
+                        transformedBody.instructions = codexInstructions;
                     }
 
                     // Add reasoning config if not 'none'
