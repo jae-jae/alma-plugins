@@ -114,7 +114,7 @@ export const ANTIGRAVITY_MODELS: AntigravityModelInfo[] = [
         id: 'gemini-2.5-pro',
         name: 'Gemini 2.5 Pro',
         description: 'Gemini 2.5 Pro - advanced reasoning model',
-        baseModel: 'gemini-2.5-pro-preview-06-05',
+        baseModel: 'gemini-2.5-pro',
         family: 'gemini',
         contextWindow: 1048576,
         maxOutputTokens: 65536,
@@ -123,42 +123,29 @@ export const ANTIGRAVITY_MODELS: AntigravityModelInfo[] = [
         id: 'gemini-2.5-flash',
         name: 'Gemini 2.5 Flash',
         description: 'Gemini 2.5 Flash - fast and efficient',
-        baseModel: 'gemini-2.5-flash-preview-05-20',
+        baseModel: 'gemini-2.5-flash',
         family: 'gemini',
         contextWindow: 1048576,
         maxOutputTokens: 65536,
     },
 
     // -------------------------------------------------------------------------
-    // Gemini 2.0 Models
+    // Gemini 3.0 Models
     // -------------------------------------------------------------------------
     {
-        id: 'gemini-2.0-flash',
-        name: 'Gemini 2.0 Flash',
-        description: 'Gemini 2.0 Flash - fast general purpose',
-        baseModel: 'gemini-2.0-flash',
-        family: 'gemini',
-        contextWindow: 1048576,
-        maxOutputTokens: 8192,
-    },
-    {
-        id: 'gemini-2.0-flash-thinking',
-        name: 'Gemini 2.0 Flash (Thinking)',
-        description: 'Gemini 2.0 Flash with thinking enabled',
-        baseModel: 'gemini-2.0-flash-thinking-exp-01-21',
+        id: 'gemini-3-pro',
+        name: 'Gemini 3 Pro',
+        description: 'Gemini 3 Pro - latest generation',
+        baseModel: 'gemini-3-pro',
         family: 'gemini',
         contextWindow: 1048576,
         maxOutputTokens: 65536,
     },
-
-    // -------------------------------------------------------------------------
-    // Gemini 3.0 Models (Preview)
-    // -------------------------------------------------------------------------
     {
-        id: 'gemini-3.0-flash',
-        name: 'Gemini 3.0 Flash',
-        description: 'Gemini 3.0 Flash - next generation',
-        baseModel: 'gemini-3.0-flash-preview',
+        id: 'gemini-3-flash',
+        name: 'Gemini 3 Flash',
+        description: 'Gemini 3 Flash - fast and efficient',
+        baseModel: 'gemini-3-flash',
         family: 'gemini',
         contextWindow: 1048576,
         maxOutputTokens: 65536,

@@ -28,9 +28,8 @@ Use your Google Antigravity IDE subscription to access Claude and Gemini models 
 
 - `gemini-2.5-pro` - Gemini 2.5 Pro (advanced reasoning)
 - `gemini-2.5-flash` - Gemini 2.5 Flash (fast and efficient)
-- `gemini-2.0-flash` - Gemini 2.0 Flash
-- `gemini-2.0-flash-thinking` - With thinking enabled
-- `gemini-3.0-flash` - Gemini 3.0 Flash (preview)
+- `gemini-3-pro` - Gemini 3 Pro (latest generation)
+- `gemini-3-flash` - Gemini 3 Flash (fast and efficient)
 
 ## Installation
 
