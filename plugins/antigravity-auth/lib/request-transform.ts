@@ -152,8 +152,8 @@ export function transformRequest(
     if (isThinking && thinkingBudget) {
         const generationConfig: GeminiGenerationConfig = geminiRequest.generationConfig || {};
 
+        // Only set thinking_budget, include_thoughts defaults to true
         generationConfig.thinkingConfig = {
-            include_thoughts: true,
             thinking_budget: thinkingBudget,
         };
 
