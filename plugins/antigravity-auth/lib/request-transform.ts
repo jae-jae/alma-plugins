@@ -146,21 +146,18 @@ export function transformRequest(
         }
     }
 
-    // Add Claude-specific thinking config
-    // IMPORTANT: Claude uses snake_case keys (include_thoughts, thinking_budget)
-    // This matches opencode-antigravity-auth behavior
+    // Add Claude-specific config
+    // Testing: completely remove thinkingConfig to see if it's the issue
     if (isThinking && thinkingBudget) {
         const generationConfig: GeminiGenerationConfig = geminiRequest.generationConfig || {};
-
-        // Only set thinking_budget, include_thoughts defaults to true
-        generationConfig.thinkingConfig = {
-            thinking_budget: thinkingBudget,
-        };
 
         // Ensure maxOutputTokens is large enough for thinking
         if (!generationConfig.maxOutputTokens || generationConfig.maxOutputTokens <= thinkingBudget) {
             generationConfig.maxOutputTokens = CLAUDE_THINKING_MAX_OUTPUT_TOKENS;
         }
+
+        // Remove thinkingConfig entirely for testing
+        delete generationConfig.thinkingConfig;
 
         geminiRequest.generationConfig = generationConfig;
     }
