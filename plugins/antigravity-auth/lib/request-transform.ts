@@ -129,15 +129,21 @@ export function transformRequest(
     const streaming = isStreamingRequest(originalUrl);
 
     // Configure Claude tool calling to use VALIDATED mode (only when tools are present)
-    // When no tools, don't set toolConfig (as shown in opencode's buildThinkingWarmupBody)
-    if (isClaude && geminiRequest.tools && geminiRequest.tools.length > 0) {
-        if (!geminiRequest.toolConfig) {
-            geminiRequest.toolConfig = {};
+    // When no tools, delete toolConfig (as shown in opencode's buildThinkingWarmupBody)
+    if (isClaude) {
+        if (geminiRequest.tools && geminiRequest.tools.length > 0) {
+            if (!geminiRequest.toolConfig) {
+                geminiRequest.toolConfig = {};
+            }
+            if (!geminiRequest.toolConfig.functionCallingConfig) {
+                geminiRequest.toolConfig.functionCallingConfig = {};
+            }
+            geminiRequest.toolConfig.functionCallingConfig.mode = 'VALIDATED';
+        } else {
+            // Delete toolConfig when no tools (AI SDK might add it automatically)
+            delete geminiRequest.toolConfig;
+            delete geminiRequest.tools;
         }
-        if (!geminiRequest.toolConfig.functionCallingConfig) {
-            geminiRequest.toolConfig.functionCallingConfig = {};
-        }
-        geminiRequest.toolConfig.functionCallingConfig.mode = 'VALIDATED';
     }
 
     // Add Claude-specific thinking config
