@@ -26,11 +26,13 @@ import { CODEX_MODELS, getBaseModelId, getReasoningEffort } from './lib/models';
 const CODEX_BASE_URL = 'https://chatgpt.com/backend-api';
 const DUMMY_API_KEY = 'chatgpt-oauth';
 
-// OpenAI-specific headers
+// OpenAI-specific headers (matching opencode)
 const OPENAI_HEADERS = {
     BETA: 'OpenAI-Beta',
     ACCOUNT_ID: 'chatgpt-account-id',
     ORIGINATOR: 'originator',
+    SESSION_ID: 'session_id',
+    CONVERSATION_ID: 'conversation_id',
 } as const;
 
 // URL path segments
@@ -237,6 +239,7 @@ export async function activate(context: PluginContext): Promise<PluginActivation
             // Step 4: Transform request body (matching opencode-openai-codex-auth exactly)
             let body = init?.body;
             let isStreaming = true; // Default to streaming
+            let promptCacheKey: string | undefined; // For prompt caching headers
 
             if (body && typeof body === 'string') {
                 try {
@@ -245,6 +248,9 @@ export async function activate(context: PluginContext): Promise<PluginActivation
                     // Track if this is a streaming request (generateText sends no stream field)
                     // streamText sends stream=true
                     isStreaming = parsed.stream === true;
+
+                    // Extract prompt_cache_key for caching headers (matching opencode)
+                    promptCacheKey = parsed.prompt_cache_key;
 
                     // Normalize model name (e.g., gpt-5.2-codex-low -> gpt-5.2-codex)
                     const originalModel = parsed.model || '';
@@ -324,7 +330,7 @@ export async function activate(context: PluginContext): Promise<PluginActivation
                 }
             }
 
-            // Step 5: Create headers with OAuth credentials
+            // Step 5: Create headers with OAuth credentials (matching opencode's createCodexHeaders)
             const headers = new Headers(init?.headers ?? {});
             headers.delete('x-api-key');
             headers.set('Authorization', `Bearer ${accessToken}`);
@@ -332,6 +338,15 @@ export async function activate(context: PluginContext): Promise<PluginActivation
             headers.set(OPENAI_HEADERS.BETA, 'responses=experimental');
             headers.set(OPENAI_HEADERS.ORIGINATOR, 'codex_cli_rs');
             headers.set('accept', 'text/event-stream');
+
+            // Set prompt cache headers if prompt_cache_key is present (matching opencode)
+            if (promptCacheKey) {
+                headers.set(OPENAI_HEADERS.CONVERSATION_ID, promptCacheKey);
+                headers.set(OPENAI_HEADERS.SESSION_ID, promptCacheKey);
+            } else {
+                headers.delete(OPENAI_HEADERS.CONVERSATION_ID);
+                headers.delete(OPENAI_HEADERS.SESSION_ID);
+            }
 
             // Step 6: Make the request
             const response = await globalThis.fetch(codexUrl, {
