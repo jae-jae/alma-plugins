@@ -134,9 +134,9 @@ MIT License
 
 ## Acknowledgments
 
-This plugin is based on and inspired by [opencode-antigravity-auth](https://github.com/opencode-ai/opencode-antigravity-auth) by the OpenCode team.
+This plugin is based on and inspired by [opencode-antigravity-auth](https://github.com/NoeFabris/opencode-antigravity-auth) by [@NoeFabris](https://github.com/NoeFabris).
 
-Special thanks to the original authors for:
+Special thanks to the original author for:
 - The Google OAuth authentication flow implementation
 - Antigravity API integration patterns
 - Multi-endpoint fallback architecture
