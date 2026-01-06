@@ -58,21 +58,24 @@ export async function activate(context: PluginContext): Promise<PluginActivation
                 await tokenStore.storePendingVerifier(verifier);
                 await tokenStore.storePendingState(state);
 
+                // Open browser for authorization
+                logger.info(`Opening authorization URL: ${url}`);
+                const opened = await ui.openExternal(url);
+                if (!opened) {
+                    logger.warn('Failed to open browser, URL:', url);
+                }
+
                 // Show instructions to user
                 ui.showNotification(
-                    'Opening browser for ChatGPT login. After logging in, copy the authorization code and paste it here.',
-                    { type: 'info', duration: 10000 }
+                    'Browser opened. After login, copy the "code" parameter from the URL bar.',
+                    { type: 'info', duration: 15000 }
                 );
-
-                // Open browser (this requires shell:execute permission or system:openExternal)
-                // For now, we'll show the URL and ask user to open it manually
-                logger.info(`Authorization URL: ${url}`);
 
                 // Ask user for the authorization code
                 const code = await ui.showInputBox({
                     title: 'ChatGPT Authorization',
-                    prompt: 'Please open this URL in your browser, log in to ChatGPT, then paste the authorization code here:',
-                    placeholder: 'Paste authorization code here...',
+                    prompt: 'After logging in, the page will show "localhost refused to connect". Copy the "code=xxx" value from the URL bar and paste it here:',
+                    placeholder: 'Paste the code parameter from URL...',
                 });
 
                 if (!code) {
