@@ -41,7 +41,7 @@ export async function activate(context: PluginContext): Promise<PluginActivation
         description: 'Access GPT-5.2 Codex and other models via your ChatGPT subscription',
         authType: 'oauth',
 
-        async initialize(initContext) {
+        async initialize() {
             logger.info('Codex provider initialized');
         },
 
@@ -137,15 +137,6 @@ export async function activate(context: PluginContext): Promise<PluginActivation
     // =========================================================================
 
     const loginCommand = commands.register('login', async () => {
-        const provider = await providers.get('openai-codex');
-        if (!provider) {
-            ui.showError('Codex provider not found');
-            return;
-        }
-
-        // Trigger authentication
-        const isAuth = await providerDisposable; // This won't work directly, need to access the registered provider
-        // For now, just show a message
         ui.showNotification('Use the provider settings to connect to ChatGPT', { type: 'info' });
     });
 
