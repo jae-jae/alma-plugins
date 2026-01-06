@@ -1,22 +1,19 @@
 /**
  * Request/Response Transformation for Antigravity
  *
- * Transforms OpenAI-style requests to Gemini format for Antigravity API.
- * Based on opencode-antigravity-auth request transformation logic.
+ * Transforms Google AI SDK requests to Antigravity API format.
+ * The AI SDK sends requests in Gemini format (contents/parts), we just need
+ * to wrap them in Antigravity's envelope format and add auth headers.
  */
 
 import type {
     AntigravityRequestBody,
     GeminiRequest,
-    GeminiContent,
-    GeminiPart,
-    GeminiTool,
-    GeminiFunctionDeclaration,
     GeminiGenerationConfig,
     HeaderStyle,
     AntigravityHeaders,
 } from './types';
-import { getModelFamily, isClaudeThinkingModel, getThinkingBudget, parseModelWithTier } from './models';
+import { getModelFamily, isClaudeThinkingModel, parseModelWithTier } from './models';
 
 // ============================================================================
 // Constants
@@ -47,10 +44,6 @@ export const GEMINI_CLI_HEADERS: AntigravityHeaders = {
 // Claude thinking model max output tokens
 const CLAUDE_THINKING_MAX_OUTPUT_TOKENS = 65536;
 
-// Placeholder for empty schemas (Claude VALIDATED mode requires at least one property)
-const EMPTY_SCHEMA_PLACEHOLDER_NAME = '_placeholder';
-const EMPTY_SCHEMA_PLACEHOLDER_DESCRIPTION = 'Placeholder. Always pass true.';
-
 // ============================================================================
 // Request URL Detection
 // ============================================================================
@@ -78,250 +71,6 @@ export function isStreamingRequest(url: string): boolean {
 }
 
 // ============================================================================
-// OpenAI to Gemini Format Conversion
-// ============================================================================
-
-interface OpenAIMessage {
-    role: 'system' | 'user' | 'assistant';
-    content: string | Array<{ type: string; text?: string; image_url?: { url: string } }>;
-    tool_calls?: Array<{
-        id: string;
-        type: 'function';
-        function: { name: string; arguments: string };
-    }>;
-    tool_call_id?: string;
-    name?: string;
-}
-
-interface OpenAITool {
-    type: 'function';
-    function: {
-        name: string;
-        description?: string;
-        parameters?: Record<string, unknown>;
-    };
-}
-
-interface OpenAIRequestBody {
-    model: string;
-    messages: OpenAIMessage[];
-    tools?: OpenAITool[];
-    stream?: boolean;
-    max_tokens?: number;
-    temperature?: number;
-    top_p?: number;
-}
-
-/**
- * Convert OpenAI messages to Gemini contents format
- */
-function convertMessagesToContents(messages: OpenAIMessage[]): {
-    contents: GeminiContent[];
-    systemInstruction?: { parts: Array<{ text: string }> };
-} {
-    const contents: GeminiContent[] = [];
-    let systemInstruction: { parts: Array<{ text: string }> } | undefined;
-
-    for (const message of messages) {
-        if (message.role === 'system') {
-            // System message goes to systemInstruction
-            const text = typeof message.content === 'string'
-                ? message.content
-                : message.content
-                    .filter((c) => c.type === 'text')
-                    .map((c) => c.text)
-                    .join('\n');
-
-            if (systemInstruction) {
-                systemInstruction.parts.push({ text });
-            } else {
-                systemInstruction = { parts: [{ text }] };
-            }
-            continue;
-        }
-
-        const role: 'user' | 'model' = message.role === 'assistant' ? 'model' : 'user';
-        const parts: GeminiPart[] = [];
-
-        // Handle content
-        if (typeof message.content === 'string') {
-            if (message.content) {
-                parts.push({ text: message.content });
-            }
-        } else if (Array.isArray(message.content)) {
-            for (const block of message.content) {
-                if (block.type === 'text' && block.text) {
-                    parts.push({ text: block.text });
-                }
-                // Image handling would go here if needed
-            }
-        }
-
-        // Handle tool calls (from assistant)
-        if (message.tool_calls) {
-            for (const toolCall of message.tool_calls) {
-                let args: Record<string, unknown> = {};
-                try {
-                    args = JSON.parse(toolCall.function.arguments);
-                } catch {
-                    // Keep empty args
-                }
-                parts.push({
-                    functionCall: {
-                        name: toolCall.function.name,
-                        args,
-                        id: toolCall.id,
-                    },
-                });
-            }
-        }
-
-        // Handle tool response (from user with tool_call_id)
-        if (message.role === 'user' && message.tool_call_id) {
-            // This is a tool result, not a regular user message
-            // Find the corresponding function call
-            const responseContent = typeof message.content === 'string'
-                ? message.content
-                : JSON.stringify(message.content);
-
-            parts.push({
-                functionResponse: {
-                    name: message.name || 'unknown',
-                    response: { result: responseContent },
-                    id: message.tool_call_id,
-                },
-            });
-        }
-
-        if (parts.length > 0) {
-            contents.push({ role, parts });
-        }
-    }
-
-    return { contents, systemInstruction };
-}
-
-/**
- * Convert OpenAI tools to Gemini function declarations
- */
-function convertToolsToFunctionDeclarations(tools: OpenAITool[], isClaude: boolean): GeminiTool[] {
-    const functionDeclarations: GeminiFunctionDeclaration[] = [];
-
-    for (const tool of tools) {
-        if (tool.type !== 'function') continue;
-
-        let parameters = tool.function.parameters;
-
-        // Claude VALIDATED mode requires at least one property
-        if (isClaude) {
-            parameters = cleanSchemaForClaude(parameters);
-        }
-
-        functionDeclarations.push({
-            name: sanitizeToolName(tool.function.name),
-            description: tool.function.description || '',
-            parameters,
-        });
-    }
-
-    if (functionDeclarations.length === 0) {
-        return [];
-    }
-
-    return [{ functionDeclarations }];
-}
-
-/**
- * Sanitize tool name (alphanumeric and underscores only)
- */
-function sanitizeToolName(name: string): string {
-    return String(name).replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 64);
-}
-
-/**
- * Clean JSON schema for Claude VALIDATED mode
- */
-function cleanSchemaForClaude(schema: Record<string, unknown> | undefined): Record<string, unknown> {
-    if (!schema || typeof schema !== 'object') {
-        return createPlaceholderSchema();
-    }
-
-    const cleaned = cleanJSONSchema(schema);
-
-    // Claude VALIDATED mode requires at least one property
-    const hasProperties =
-        cleaned.properties &&
-        typeof cleaned.properties === 'object' &&
-        Object.keys(cleaned.properties as object).length > 0;
-
-    cleaned.type = 'object';
-
-    if (!hasProperties) {
-        cleaned.properties = {
-            [EMPTY_SCHEMA_PLACEHOLDER_NAME]: {
-                type: 'boolean',
-                description: EMPTY_SCHEMA_PLACEHOLDER_DESCRIPTION,
-            },
-        };
-        cleaned.required = [EMPTY_SCHEMA_PLACEHOLDER_NAME];
-    }
-
-    return cleaned;
-}
-
-/**
- * Create a placeholder schema for empty parameters
- */
-function createPlaceholderSchema(): Record<string, unknown> {
-    return {
-        type: 'object',
-        properties: {
-            [EMPTY_SCHEMA_PLACEHOLDER_NAME]: {
-                type: 'boolean',
-                description: EMPTY_SCHEMA_PLACEHOLDER_DESCRIPTION,
-            },
-        },
-        required: [EMPTY_SCHEMA_PLACEHOLDER_NAME],
-    };
-}
-
-/**
- * Clean JSON schema - remove unsupported fields
- */
-function cleanJSONSchema(schema: Record<string, unknown>): Record<string, unknown> {
-    const allowedKeys = [
-        'type', 'properties', 'required', 'items', 'enum', 'description',
-        'minimum', 'maximum', 'minLength', 'maxLength', 'pattern',
-        'additionalProperties', 'oneOf', 'anyOf', 'allOf',
-    ];
-
-    const cleaned: Record<string, unknown> = {};
-
-    for (const key of allowedKeys) {
-        if (key in schema) {
-            const value = schema[key];
-            if (key === 'properties' && typeof value === 'object' && value !== null) {
-                const props: Record<string, unknown> = {};
-                for (const [propName, propValue] of Object.entries(value as Record<string, unknown>)) {
-                    if (typeof propValue === 'object' && propValue !== null) {
-                        props[propName] = cleanJSONSchema(propValue as Record<string, unknown>);
-                    } else {
-                        props[propName] = propValue;
-                    }
-                }
-                cleaned[key] = props;
-            } else if (key === 'items' && typeof value === 'object' && value !== null) {
-                cleaned[key] = cleanJSONSchema(value as Record<string, unknown>);
-            } else {
-                cleaned[key] = value;
-            }
-        }
-    }
-
-    return cleaned;
-}
-
-// ============================================================================
 // Request Transformation
 // ============================================================================
 
@@ -335,7 +84,22 @@ export interface TransformResult {
 }
 
 /**
- * Transform OpenAI-style request to Antigravity format
+ * Transform Google AI SDK request to Antigravity format.
+ *
+ * The AI SDK sends requests in Gemini format:
+ * {
+ *   contents: [...],
+ *   systemInstruction: {...},
+ *   tools: [...],
+ *   generationConfig: {...}
+ * }
+ *
+ * We wrap this in Antigravity's envelope:
+ * {
+ *   project: "...",
+ *   model: "...",
+ *   request: { ...geminiRequest }
+ * }
  */
 export function transformRequest(
     originalUrl: string,
@@ -345,42 +109,45 @@ export function transformRequest(
     headerStyle: HeaderStyle = 'antigravity',
     endpoint: string = PRIMARY_ENDPOINT
 ): TransformResult {
-    let parsed: OpenAIRequestBody;
+    let parsed: any;
     try {
         parsed = JSON.parse(body);
     } catch {
         throw new Error('Invalid request body');
     }
 
-    const requestedModel = parsed.model;
+    // Extract model from URL (e.g., /models/claude-sonnet-4-5-thinking:streamGenerateContent)
+    const modelFromUrl = extractModelFromUrl(originalUrl);
+    const requestedModel = modelFromUrl || parsed.model || 'unknown';
     const { baseModel, thinkingLevel, thinkingBudget } = parseModelWithTier(requestedModel);
     const effectiveModel = baseModel;
     const family = getModelFamily(requestedModel);
     const isClaude = family === 'claude';
     const isThinking = isClaudeThinkingModel(requestedModel);
-    const streaming = isStreamingRequest(originalUrl) || parsed.stream === true;
+    const streaming = isStreamingRequest(originalUrl);
 
-    // Convert messages to Gemini format
-    const { contents, systemInstruction } = convertMessagesToContents(parsed.messages);
-
-    // Build Gemini request
+    // The request body from AI SDK is already in Gemini format
+    // We just need to enhance it and wrap it
     const geminiRequest: GeminiRequest = {
-        contents,
+        contents: parsed.contents || [],
     };
 
-    if (systemInstruction) {
-        geminiRequest.systemInstruction = systemInstruction;
+    // Copy system instruction if present
+    if (parsed.systemInstruction) {
+        geminiRequest.systemInstruction = parsed.systemInstruction;
 
         // Add thinking hint for Claude thinking models with tools
         if (isThinking && parsed.tools && parsed.tools.length > 0) {
             const hint = 'Interleaved thinking is enabled. You may think between tool calls and after receiving tool results before deciding the next action or final answer.';
-            geminiRequest.systemInstruction.parts.push({ text: hint });
+            if (geminiRequest.systemInstruction.parts) {
+                geminiRequest.systemInstruction.parts.push({ text: hint });
+            }
         }
     }
 
-    // Convert tools
-    if (parsed.tools && parsed.tools.length > 0) {
-        geminiRequest.tools = convertToolsToFunctionDeclarations(parsed.tools, isClaude);
+    // Copy tools if present
+    if (parsed.tools) {
+        geminiRequest.tools = parsed.tools;
 
         // Set tool config for Claude VALIDATED mode
         if (isClaude) {
@@ -393,17 +160,7 @@ export function transformRequest(
     }
 
     // Build generation config
-    const generationConfig: GeminiGenerationConfig = {};
-
-    if (parsed.max_tokens) {
-        generationConfig.maxOutputTokens = parsed.max_tokens;
-    }
-    if (parsed.temperature !== undefined) {
-        generationConfig.temperature = parsed.temperature;
-    }
-    if (parsed.top_p !== undefined) {
-        generationConfig.topP = parsed.top_p;
-    }
+    const generationConfig: GeminiGenerationConfig = parsed.generationConfig || {};
 
     // Add thinking config for Claude thinking models
     if (isThinking && thinkingBudget) {
@@ -412,7 +169,8 @@ export function transformRequest(
             thinking_budget: thinkingBudget,
         };
         // Ensure maxOutputTokens is large enough
-        if (!generationConfig.maxOutputTokens || generationConfig.maxOutputTokens <= thinkingBudget) {
+        const currentMax = generationConfig.maxOutputTokens || generationConfig.max_output_tokens || 0;
+        if (!currentMax || currentMax <= thinkingBudget) {
             generationConfig.maxOutputTokens = CLAUDE_THINKING_MAX_OUTPUT_TOKENS;
         }
     }
@@ -471,7 +229,8 @@ export function transformRequest(
 // ============================================================================
 
 /**
- * Transform Antigravity SSE response to OpenAI format
+ * Transform Antigravity SSE response.
+ * The response needs to be unwrapped from Antigravity's envelope format.
  */
 export function transformStreamingResponse(response: Response): Response {
     if (!response.body) {
@@ -481,14 +240,24 @@ export function transformStreamingResponse(response: Response): Response {
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     const encoder = new TextEncoder();
+    let buffer = '';
 
     const transformStream = new TransformStream({
         async transform(chunk, controller) {
-            const text = decoder.decode(chunk, { stream: true });
-            const lines = text.split('\n');
+            buffer += decoder.decode(chunk, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || ''; // Keep incomplete line in buffer
 
             for (const line of lines) {
-                if (!line.startsWith('data: ')) continue;
+                if (!line.trim()) {
+                    controller.enqueue(encoder.encode('\n'));
+                    continue;
+                }
+
+                if (!line.startsWith('data: ')) {
+                    controller.enqueue(encoder.encode(line + '\n'));
+                    continue;
+                }
 
                 const dataStr = line.slice(6).trim();
                 if (!dataStr || dataStr === '[DONE]') {
@@ -498,14 +267,20 @@ export function transformStreamingResponse(response: Response): Response {
 
                 try {
                     const data = JSON.parse(dataStr);
-                    const transformed = transformSSEPayload(data);
-                    controller.enqueue(encoder.encode(`data: ${JSON.stringify(transformed)}\n\n`));
+                    // Unwrap Antigravity envelope - the 'response' field contains the actual Gemini response
+                    const unwrapped = data.response || data;
+                    controller.enqueue(encoder.encode(`data: ${JSON.stringify(unwrapped)}\n`));
                 } catch {
                     // Pass through as-is if parsing fails
                     controller.enqueue(encoder.encode(line + '\n'));
                 }
             }
         },
+        flush(controller) {
+            if (buffer.trim()) {
+                controller.enqueue(encoder.encode(buffer + '\n'));
+            }
+        }
     });
 
     return new Response(response.body.pipeThrough(transformStream), {
@@ -516,70 +291,8 @@ export function transformStreamingResponse(response: Response): Response {
 }
 
 /**
- * Transform a single SSE payload from Gemini to OpenAI format
- */
-function transformSSEPayload(data: any): any {
-    // If already in OpenAI format, return as-is
-    if (data.choices || data.object === 'chat.completion.chunk') {
-        return data;
-    }
-
-    // Transform Gemini format to OpenAI format
-    const candidates = data.candidates || [];
-    const choices = candidates.map((candidate: any, index: number) => {
-        const content = candidate.content || {};
-        const parts = content.parts || [];
-
-        let text = '';
-        const toolCalls: any[] = [];
-
-        for (const part of parts) {
-            if (part.thought && part.text) {
-                // Transform thinking part to reasoning
-                // OpenAI format uses reasoning_content
-            } else if (part.text) {
-                text += part.text;
-            } else if (part.functionCall) {
-                toolCalls.push({
-                    index: toolCalls.length,
-                    id: part.functionCall.id || `call_${toolCalls.length}`,
-                    type: 'function',
-                    function: {
-                        name: part.functionCall.name,
-                        arguments: JSON.stringify(part.functionCall.args || {}),
-                    },
-                });
-            }
-        }
-
-        const delta: any = {};
-        if (text) {
-            delta.content = text;
-        }
-        if (toolCalls.length > 0) {
-            delta.tool_calls = toolCalls;
-        }
-
-        return {
-            index,
-            delta,
-            finish_reason: candidate.finishReason?.toLowerCase() || null,
-        };
-    });
-
-    return {
-        object: 'chat.completion.chunk',
-        choices,
-        usage: data.usageMetadata ? {
-            prompt_tokens: data.usageMetadata.promptTokenCount || 0,
-            completion_tokens: data.usageMetadata.candidatesTokenCount || 0,
-            total_tokens: data.usageMetadata.totalTokenCount || 0,
-        } : undefined,
-    };
-}
-
-/**
- * Transform non-streaming response from Gemini to OpenAI format
+ * Transform non-streaming response from Antigravity.
+ * Unwrap the Antigravity envelope format.
  */
 export async function transformNonStreamingResponse(response: Response): Promise<Response> {
     const text = await response.text();
@@ -587,74 +300,16 @@ export async function transformNonStreamingResponse(response: Response): Promise
     try {
         const data = JSON.parse(text);
 
-        // If already in OpenAI format, return as-is
-        if (data.choices || data.object === 'chat.completion') {
-            return new Response(text, {
-                status: response.status,
-                statusText: response.statusText,
-                headers: response.headers,
-            });
-        }
+        // Unwrap Antigravity envelope - the 'response' field contains the actual Gemini response
+        const unwrapped = data.response || data;
 
-        // Handle wrapped response
-        const responseData = data.response || data;
-
-        const candidates = responseData.candidates || [];
-        const choices = candidates.map((candidate: any, index: number) => {
-            const content = candidate.content || {};
-            const parts = content.parts || [];
-
-            let text = '';
-            const toolCalls: any[] = [];
-
-            for (const part of parts) {
-                if (part.text && !part.thought) {
-                    text += part.text;
-                } else if (part.functionCall) {
-                    toolCalls.push({
-                        id: part.functionCall.id || `call_${toolCalls.length}`,
-                        type: 'function',
-                        function: {
-                            name: part.functionCall.name,
-                            arguments: JSON.stringify(part.functionCall.args || {}),
-                        },
-                    });
-                }
-            }
-
-            const message: any = {
-                role: 'assistant',
-                content: text || null,
-            };
-            if (toolCalls.length > 0) {
-                message.tool_calls = toolCalls;
-            }
-
-            return {
-                index,
-                message,
-                finish_reason: candidate.finishReason?.toLowerCase() || 'stop',
-            };
-        });
-
-        const usage = responseData.usageMetadata || data.usageMetadata;
-        const transformed = {
-            object: 'chat.completion',
-            choices,
-            usage: usage ? {
-                prompt_tokens: usage.promptTokenCount || 0,
-                completion_tokens: usage.candidatesTokenCount || 0,
-                total_tokens: usage.totalTokenCount || 0,
-            } : undefined,
-        };
-
-        return new Response(JSON.stringify(transformed), {
+        return new Response(JSON.stringify(unwrapped), {
             status: response.status,
             statusText: response.statusText,
             headers: response.headers,
         });
     } catch {
-        // Return original response if transformation fails
+        // Return original response if parsing fails
         return new Response(text, {
             status: response.status,
             statusText: response.statusText,
