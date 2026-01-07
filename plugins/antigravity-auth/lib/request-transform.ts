@@ -14,6 +14,7 @@ import type {
     AntigravityRequestBody,
     GeminiRequest,
     GeminiGenerationConfig,
+    GeminiContent,
     HeaderStyle,
     AntigravityHeaders,
 } from './types';
@@ -75,6 +76,45 @@ export function isStreamingRequest(url: string): boolean {
 }
 
 // ============================================================================
+// Conversation Sanitization
+// ============================================================================
+
+/**
+ * Strip thinking parts from conversation history.
+ * Claude requires a signature for thinking blocks in multi-turn conversations,
+ * but we don't have access to the signature from previous responses.
+ * The safest approach is to remove thinking parts from history.
+ */
+function stripThinkingFromContents(contents: GeminiContent[]): GeminiContent[] {
+    return contents.map(content => {
+        if (!content.parts) return content;
+
+        // Filter out parts that are thinking blocks (have thought: true)
+        const filteredParts = content.parts.filter(part => {
+            // Skip parts with thought: true (these are thinking blocks without signatures)
+            if (part.thought === true && !part.thoughtSignature) {
+                return false;
+            }
+            return true;
+        });
+
+        // If all parts were filtered out, keep at least one empty text part
+        // to maintain valid message structure
+        if (filteredParts.length === 0) {
+            return {
+                ...content,
+                parts: [{ text: '' }],
+            };
+        }
+
+        return {
+            ...content,
+            parts: filteredParts,
+        };
+    });
+}
+
+// ============================================================================
 // Request Transformation
 // ============================================================================
 
@@ -127,6 +167,12 @@ export function transformRequest(
     const isClaude = family === 'claude';
     const isThinking = isClaudeThinkingModel(requestedModel);
     const streaming = isStreamingRequest(originalUrl);
+
+    // Strip thinking parts from conversation history for Claude models
+    // Claude requires signatures for thinking blocks, but we don't have them
+    if (isClaude && geminiRequest.contents) {
+        geminiRequest.contents = stripThinkingFromContents(geminiRequest.contents);
+    }
 
     // Configure Claude tool calling to use VALIDATED mode (only when tools are present)
     // When no tools, delete toolConfig (as shown in opencode's buildThinkingWarmupBody)
