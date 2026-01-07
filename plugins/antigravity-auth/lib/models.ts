@@ -156,6 +156,8 @@ export const ANTIGRAVITY_MODELS: AntigravityModelInfo[] = [
         contextWindow: 1048576,
         maxOutputTokens: 65536,
         imageOutput: true,
+        functionCalling: true,
+        reasoning: true,
     },
     {
         id: 'gemini-3-pro-image-16x9',
@@ -166,6 +168,8 @@ export const ANTIGRAVITY_MODELS: AntigravityModelInfo[] = [
         contextWindow: 1048576,
         maxOutputTokens: 65536,
         imageOutput: true,
+        functionCalling: true,
+        reasoning: true,
     },
     {
         id: 'gemini-3-pro-image-9x16',
@@ -176,6 +180,8 @@ export const ANTIGRAVITY_MODELS: AntigravityModelInfo[] = [
         contextWindow: 1048576,
         maxOutputTokens: 65536,
         imageOutput: true,
+        functionCalling: true,
+        reasoning: true,
     },
     {
         id: 'gemini-3-pro-image-4x3',
@@ -186,6 +192,8 @@ export const ANTIGRAVITY_MODELS: AntigravityModelInfo[] = [
         contextWindow: 1048576,
         maxOutputTokens: 65536,
         imageOutput: true,
+        functionCalling: true,
+        reasoning: true,
     },
     {
         id: 'gemini-3-pro-image-3x4',
@@ -196,6 +204,8 @@ export const ANTIGRAVITY_MODELS: AntigravityModelInfo[] = [
         contextWindow: 1048576,
         maxOutputTokens: 65536,
         imageOutput: true,
+        functionCalling: true,
+        reasoning: true,
     },
     {
         id: 'gemini-3-pro-image-21x9',
@@ -206,6 +216,8 @@ export const ANTIGRAVITY_MODELS: AntigravityModelInfo[] = [
         contextWindow: 1048576,
         maxOutputTokens: 65536,
         imageOutput: true,
+        functionCalling: true,
+        reasoning: true,
     },
 ];
 

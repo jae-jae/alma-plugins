@@ -344,10 +344,6 @@ export function transformRequest(
 
         geminiRequest.generationConfig = generationConfig;
 
-        // Remove tools for image models (they don't support function calling)
-        delete geminiRequest.tools;
-        delete geminiRequest.toolConfig;
-
         logger?.debug(`Image generation config: model=${requestedModel}, aspectRatio=${aspectRatio}`);
     }
 

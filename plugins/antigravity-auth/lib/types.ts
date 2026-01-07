@@ -45,6 +45,8 @@ export interface AntigravityModelInfo {
     contextWindow?: number;
     maxOutputTokens?: number;
     imageOutput?: boolean; // Model can generate images
+    functionCalling?: boolean; // Model supports function/tool calling
+    reasoning?: boolean; // Model supports reasoning/thinking
 }
 
 // ============================================================================

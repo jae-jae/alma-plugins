@@ -319,8 +319,8 @@ export async function activate(context: PluginContext): Promise<PluginActivation
                 maxOutputTokens: model.maxOutputTokens,
                 capabilities: {
                     streaming: true,
-                    reasoning: isClaudeThinkingModel(model.id),
-                    functionCalling: !model.imageOutput, // Image models don't support function calling
+                    reasoning: model.reasoning ?? isClaudeThinkingModel(model.id),
+                    functionCalling: model.functionCalling ?? true,
                     imageOutput: model.imageOutput ?? false,
                 },
                 providerOptions: {
