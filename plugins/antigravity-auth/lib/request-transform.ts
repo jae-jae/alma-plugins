@@ -22,6 +22,7 @@ import type {
 import { getModelFamily, isClaudeThinkingModel, parseModelWithTier } from './models';
 import { cacheSignature, getCachedSignature } from './signature-cache';
 import { sanitizeToolsForAntigravity } from './schema-sanitizer';
+import { analyzeConversationState, closeToolLoopForThinking, needsThinkingRecovery } from './thinking-recovery';
 
 // ============================================================================
 // Constants
@@ -316,6 +317,17 @@ export function transformRequest(
             geminiRequest.systemInstruction.parts.push({ text: hint });
         } else {
             geminiRequest.systemInstruction = { parts: [{ text: hint }] };
+        }
+    }
+
+    // Thinking recovery: "Let it crash and start again"
+    // When Claude thinking model has corrupted conversation state (tool calls without thinking),
+    // we close the current turn and start a new one so Claude can generate fresh thinking.
+    if (isThinking && geminiRequest.contents) {
+        const conversationState = analyzeConversationState(geminiRequest.contents);
+        if (needsThinkingRecovery(conversationState)) {
+            logger?.debug('Thinking recovery: closing tool loop and starting fresh turn');
+            geminiRequest.contents = closeToolLoopForThinking(geminiRequest.contents);
         }
     }
 
