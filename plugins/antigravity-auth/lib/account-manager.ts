@@ -21,6 +21,9 @@ export type QuotaKey = 'claude' | 'gemini-antigravity' | 'gemini-cli' | 'gemini-
 // Rate limit reason types (matching Antigravity-Manager)
 export type RateLimitReason = 'quota_exhausted' | 'rate_limit_exceeded' | 'server_error' | 'unknown';
 
+// Subscription tier (matching Antigravity-Manager)
+export type SubscriptionTier = 'ULTRA' | 'PRO' | 'FREE' | 'UNKNOWN';
+
 // Default cooldown times in ms (matching Antigravity-Manager)
 export const RATE_LIMIT_DEFAULTS = {
     quota_exhausted: 60 * 60 * 1000,     // 1 hour for quota exhaustion
@@ -28,6 +31,9 @@ export const RATE_LIMIT_DEFAULTS = {
     server_error: 20 * 1000,              // 20 seconds for server errors
     unknown: 60 * 1000,                   // 60 seconds for unknown errors
 } as const;
+
+// 60s global lock duration (matching Antigravity-Manager)
+export const GLOBAL_LOCK_DURATION_MS = 60 * 1000;
 
 export interface ManagedAccount {
     index: number;
@@ -42,6 +48,8 @@ export interface ManagedAccount {
     rateLimitResetTimes: Partial<Record<QuotaKey, number>>;
     /** Last switch reason */
     lastSwitchReason?: 'rate-limit' | 'initial' | 'rotation';
+    /** Subscription tier (ULTRA > PRO > FREE) for priority sorting */
+    subscriptionTier?: SubscriptionTier;
 }
 
 export interface AccountStorageData {
@@ -53,11 +61,34 @@ export interface AccountStorageData {
         addedAt: number;
         lastUsed: number;
         rateLimitResetTimes?: Partial<Record<QuotaKey, number>>;
+        subscriptionTier?: SubscriptionTier;
     }>;
     activeIndexByFamily: {
         claude: number;
         gemini: number;
     };
+}
+
+/**
+ * Get subscription tier priority (lower = higher priority)
+ * Matches Antigravity-Manager: ULTRA > PRO > FREE
+ */
+function getTierPriority(tier: SubscriptionTier | undefined): number {
+    switch (tier) {
+        case 'ULTRA': return 0;
+        case 'PRO': return 1;
+        case 'FREE': return 2;
+        default: return 3;
+    }
+}
+
+/**
+ * Sort accounts by subscription tier priority (ULTRA > PRO > FREE)
+ */
+function sortAccountsByTier(accounts: ManagedAccount[]): ManagedAccount[] {
+    return [...accounts].sort((a, b) =>
+        getTierPriority(a.subscriptionTier) - getTierPriority(b.subscriptionTier)
+    );
 }
 
 // ============================================================================
@@ -186,15 +217,27 @@ function clearExpiredRateLimits(account: ManagedAccount): void {
 }
 
 // ============================================================================
+// Session and Global Lock Types
+// ============================================================================
+
+interface LastUsedInfo {
+    accountIndex: number;
+    timestamp: number;
+    family: ModelFamily;
+}
+
+// ============================================================================
 // AccountManager Class
 // ============================================================================
 
 /**
  * Multi-account manager with automatic rotation on rate limits.
  *
- * Uses the same account until it hits a rate limit (429), then switches.
- * Rate limits are tracked per-model-family (claude/gemini) so an account
- * rate-limited for Claude can still be used for Gemini.
+ * Matches Antigravity-Manager logic:
+ * 1. Session stickiness: same session ID always uses same account
+ * 2. 60s global lock: non-image requests reuse same account within 60s
+ * 3. Tier priority: ULTRA > PRO > FREE when selecting new accounts
+ * 4. Rate limit tracking: per quota key (claude, gemini-antigravity, gemini-cli, gemini-image)
  */
 export class AccountManager {
     private accounts: ManagedAccount[] = [];
@@ -204,6 +247,12 @@ export class AccountManager {
         gemini: -1,
     };
     private logger?: { debug: (msg: string, ...args: unknown[]) => void; info: (msg: string, ...args: unknown[]) => void };
+
+    /** Session fingerprint -> account index binding (for conversation stickiness) */
+    private sessionBindings: Map<string, number> = new Map();
+
+    /** Last used account info for 60s global lock (non-image requests) */
+    private lastUsedInfo: LastUsedInfo | null = null;
 
     constructor(
         logger?: { debug: (msg: string, ...args: unknown[]) => void; info: (msg: string, ...args: unknown[]) => void }
@@ -230,6 +279,7 @@ export class AccountManager {
             addedAt: acc.addedAt,
             lastUsed: acc.lastUsed,
             rateLimitResetTimes: acc.rateLimitResetTimes || {},
+            subscriptionTier: acc.subscriptionTier,
         }));
 
         this.currentAccountIndexByFamily.claude = Math.max(0, data.activeIndexByFamily?.claude ?? 0) % Math.max(1, this.accounts.length);
@@ -252,6 +302,7 @@ export class AccountManager {
                 rateLimitResetTimes: Object.keys(acc.rateLimitResetTimes).length > 0
                     ? acc.rateLimitResetTimes
                     : undefined,
+                subscriptionTier: acc.subscriptionTier,
             })),
             activeIndexByFamily: {
                 claude: Math.max(0, this.currentAccountIndexByFamily.claude),
@@ -366,35 +417,166 @@ export class AccountManager {
         return null;
     }
 
-    /**
-     * Get current or next available account for a model family.
-     * Automatically rotates to next account if current is rate limited.
-     */
-    getCurrentOrNextForFamily(family: ModelFamily): ManagedAccount | null {
-        const current = this.getCurrentAccountForFamily(family);
+    // =========================================================================
+    // Session Stickiness (matching Antigravity-Manager)
+    // =========================================================================
 
-        if (current) {
-            clearExpiredRateLimits(current);
-            if (!isRateLimitedForFamily(current, family)) {
-                current.lastUsed = nowMs();
-                return current;
+    /**
+     * Get account bound to a session, if any
+     */
+    getAccountForSession(sessionId: string): ManagedAccount | null {
+        const index = this.sessionBindings.get(sessionId);
+        if (index !== undefined && index < this.accounts.length) {
+            const account = this.accounts[index];
+            if (account) {
+                clearExpiredRateLimits(account);
+                return account;
             }
         }
-
-        // Current is rate limited, find next available
-        const next = this.getNextForFamily(family);
-        if (next) {
-            this.currentAccountIndexByFamily[family] = next.index;
-            next.lastSwitchReason = 'rate-limit';
-            this.logger?.info(`Switched to account ${next.index} (${next.email || 'unknown'}) for ${family} due to rate limit`);
-        }
-        return next;
+        return null;
     }
 
     /**
-     * Get next available account for a model family
+     * Bind a session to an account
      */
-    getNextForFamily(family: ModelFamily): ManagedAccount | null {
+    bindSession(sessionId: string, accountIndex: number): void {
+        this.sessionBindings.set(sessionId, accountIndex);
+        this.logger?.debug(`Bound session ${sessionId.slice(0, 8)}... to account ${accountIndex}`);
+    }
+
+    /**
+     * Unbind a session (e.g., when account becomes unavailable)
+     */
+    unbindSession(sessionId: string): void {
+        this.sessionBindings.delete(sessionId);
+    }
+
+    /**
+     * Clear all session bindings (e.g., on logout)
+     */
+    clearSessionBindings(): void {
+        this.sessionBindings.clear();
+    }
+
+    // =========================================================================
+    // 60s Global Lock (matching Antigravity-Manager)
+    // =========================================================================
+
+    /**
+     * Check if global lock is active and account is still valid
+     */
+    private getGlobalLockedAccount(family: ModelFamily): ManagedAccount | null {
+        if (!this.lastUsedInfo) return null;
+
+        const elapsed = nowMs() - this.lastUsedInfo.timestamp;
+        if (elapsed > GLOBAL_LOCK_DURATION_MS) {
+            // Lock expired
+            return null;
+        }
+
+        // Same family check - only reuse if requesting same family
+        if (this.lastUsedInfo.family !== family) {
+            return null;
+        }
+
+        const account = this.accounts[this.lastUsedInfo.accountIndex];
+        if (!account) return null;
+
+        clearExpiredRateLimits(account);
+        if (!isRateLimitedForFamily(account, family)) {
+            return account;
+        }
+
+        return null;
+    }
+
+    /**
+     * Update global lock with recently used account
+     */
+    private updateGlobalLock(accountIndex: number, family: ModelFamily): void {
+        this.lastUsedInfo = {
+            accountIndex,
+            timestamp: nowMs(),
+            family,
+        };
+    }
+
+    // =========================================================================
+    // Account Selection (matching Antigravity-Manager full logic)
+    // =========================================================================
+
+    /**
+     * Get account for a request with full Antigravity-Manager logic:
+     * 1. Session stickiness: if session is bound to an account, use it
+     * 2. 60s global lock: for non-image requests, reuse same account within 60s
+     * 3. Tier priority: when selecting new account, prefer ULTRA > PRO > FREE
+     * 4. Rate limit aware: skip rate-limited accounts
+     *
+     * @param family Model family (claude/gemini)
+     * @param sessionId Optional session ID for stickiness
+     * @param isImageRequest Whether this is an image generation request (skips 60s lock)
+     */
+    getAccountForRequest(
+        family: ModelFamily,
+        sessionId?: string,
+        isImageRequest: boolean = false
+    ): ManagedAccount | null {
+        // 1. Session stickiness: check if session is bound to an account
+        if (sessionId) {
+            const boundAccount = this.getAccountForSession(sessionId);
+            if (boundAccount && !isRateLimitedForFamily(boundAccount, family)) {
+                this.logger?.debug(`Using session-bound account ${boundAccount.index} for session ${sessionId.slice(0, 8)}...`);
+                boundAccount.lastUsed = nowMs();
+                this.updateGlobalLock(boundAccount.index, family);
+                return boundAccount;
+            }
+            // If bound account is rate-limited, unbind and select new
+            if (boundAccount) {
+                this.logger?.info(`Session-bound account ${boundAccount.index} is rate-limited, selecting new account`);
+                this.unbindSession(sessionId);
+            }
+        }
+
+        // 2. 60s global lock (skip for image requests - they have separate quotas)
+        if (!isImageRequest) {
+            const lockedAccount = this.getGlobalLockedAccount(family);
+            if (lockedAccount) {
+                this.logger?.debug(`Using global-locked account ${lockedAccount.index} (within 60s window)`);
+                lockedAccount.lastUsed = nowMs();
+                // Bind session to this account if session ID provided
+                if (sessionId) {
+                    this.bindSession(sessionId, lockedAccount.index);
+                }
+                return lockedAccount;
+            }
+        }
+
+        // 3. Select best available account with tier priority
+        const account = this.selectBestAvailableAccount(family);
+        if (account) {
+            account.lastUsed = nowMs();
+            this.updateGlobalLock(account.index, family);
+            this.currentAccountIndexByFamily[family] = account.index;
+
+            // Bind session to selected account
+            if (sessionId) {
+                this.bindSession(sessionId, account.index);
+            }
+
+            this.logger?.info(`Selected account ${account.index} (${account.email || 'unknown'}, tier=${account.subscriptionTier || 'UNKNOWN'}) for ${family}`);
+        }
+
+        return account;
+    }
+
+    /**
+     * Select best available account based on:
+     * 1. Not rate-limited for the family
+     * 2. Highest tier priority (ULTRA > PRO > FREE)
+     * 3. Least recently used (for load balancing within same tier)
+     */
+    private selectBestAvailableAccount(family: ModelFamily): ManagedAccount | null {
+        // Filter to non-rate-limited accounts
         const available = this.accounts.filter(a => {
             clearExpiredRateLimits(a);
             return !isRateLimitedForFamily(a, family);
@@ -404,14 +586,33 @@ export class AccountManager {
             return null;
         }
 
-        const account = available[this.cursor % available.length];
-        if (!account) {
-            return null;
-        }
+        // Sort by tier priority (lower = better), then by lastUsed (older = better)
+        const sorted = [...available].sort((a, b) => {
+            const tierDiff = getTierPriority(a.subscriptionTier) - getTierPriority(b.subscriptionTier);
+            if (tierDiff !== 0) return tierDiff;
+            // Same tier: prefer least recently used
+            return a.lastUsed - b.lastUsed;
+        });
 
-        this.cursor++;
-        account.lastUsed = nowMs();
-        return account;
+        return sorted[0] ?? null;
+    }
+
+    /**
+     * Get current or next available account for a model family.
+     * Automatically rotates to next account if current is rate limited.
+     *
+     * @deprecated Use getAccountForRequest() for full Antigravity-Manager logic
+     */
+    getCurrentOrNextForFamily(family: ModelFamily): ManagedAccount | null {
+        // Delegate to new method without session binding
+        return this.getAccountForRequest(family);
+    }
+
+    /**
+     * Get next available account for a model family
+     */
+    getNextForFamily(family: ModelFamily): ManagedAccount | null {
+        return this.selectBestAvailableAccount(family);
     }
 
     /**

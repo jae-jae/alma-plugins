@@ -127,11 +127,21 @@ export class TokenStore {
     }
 
     /**
-     * Get valid access token for a model family.
-     * Automatically rotates to next account if current is rate limited.
+     * Get valid access token for a request with full Antigravity-Manager logic:
+     * - Session stickiness: same session uses same account
+     * - 60s global lock: non-image requests reuse account within 60s
+     * - Tier priority: ULTRA > PRO > FREE
+     *
+     * @param family Model family (claude/gemini)
+     * @param sessionId Optional session ID for conversation stickiness
+     * @param isImageRequest Whether this is an image generation request
      */
-    async getValidAccessTokenForFamily(family: ModelFamily): Promise<{ accessToken: string; projectId: string; account: ManagedAccount; headerStyle: HeaderStyle }> {
-        const account = this.accountManager.getCurrentOrNextForFamily(family);
+    async getValidAccessTokenForRequest(
+        family: ModelFamily,
+        sessionId?: string,
+        isImageRequest: boolean = false
+    ): Promise<{ accessToken: string; projectId: string; account: ManagedAccount; headerStyle: HeaderStyle }> {
+        const account = this.accountManager.getAccountForRequest(family, sessionId, isImageRequest);
 
         if (!account) {
             if (this.accountManager.getAccountCount() === 0) {
@@ -156,6 +166,16 @@ export class TokenStore {
             account,
             headerStyle,
         };
+    }
+
+    /**
+     * Get valid access token for a model family.
+     * Automatically rotates to next account if current is rate limited.
+     *
+     * @deprecated Use getValidAccessTokenForRequest() for full Antigravity-Manager logic
+     */
+    async getValidAccessTokenForFamily(family: ModelFamily): Promise<{ accessToken: string; projectId: string; account: ManagedAccount; headerStyle: HeaderStyle }> {
+        return this.getValidAccessTokenForRequest(family);
     }
 
     /**

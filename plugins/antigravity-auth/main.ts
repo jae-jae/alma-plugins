@@ -44,6 +44,55 @@ const HTTP_STATUS = {
 const DEFAULT_RETRY_AFTER_MS = 5 * 60 * 1000;
 
 // ============================================================================
+// Session Fingerprint Extraction
+// ============================================================================
+
+/**
+ * Extract or generate a session fingerprint from the request body.
+ * This is used for session stickiness - same conversation should use same account.
+ *
+ * Matching Antigravity-Manager's session fingerprinting logic:
+ * - Uses contents hash for conversation context continuity
+ * - Falls back to generating from first message if no existing context
+ */
+function extractSessionFingerprint(body: string): string | undefined {
+    try {
+        const parsed = JSON.parse(body);
+
+        // Check for explicit session ID
+        if (parsed.sessionId && typeof parsed.sessionId === 'string') {
+            return parsed.sessionId;
+        }
+
+        // Generate fingerprint from contents (conversation history)
+        // This ensures the same conversation thread uses the same account
+        if (Array.isArray(parsed.contents) && parsed.contents.length > 0) {
+            // Use first few messages to create a stable fingerprint
+            const fingerprint = parsed.contents
+                .slice(0, 3)
+                .map((c: { role?: string; parts?: Array<{ text?: string }> }) => {
+                    const role = c.role || '';
+                    const text = c.parts?.[0]?.text?.slice(0, 50) || '';
+                    return `${role}:${text}`;
+                })
+                .join('|');
+
+            // Simple hash function
+            let hash = 0;
+            for (let i = 0; i < fingerprint.length; i++) {
+                const char = fingerprint.charCodeAt(i);
+                hash = ((hash << 5) - hash) + char;
+                hash = hash & hash; // Convert to 32-bit integer
+            }
+            return `session_${Math.abs(hash).toString(16)}`;
+        }
+    } catch {
+        // JSON parse failed, no fingerprint
+    }
+    return undefined;
+}
+
+// ============================================================================
 // Plugin Activation
 // ============================================================================
 
@@ -120,6 +169,12 @@ export async function activate(context: PluginContext): Promise<PluginActivation
                 throw new Error('Request body must be a string');
             }
 
+            // Detect if this is an image generation request
+            const isImage = isImageModel(urlModel);
+
+            // Extract session fingerprint for conversation stickiness
+            const sessionId = extractSessionFingerprint(body);
+
             // Try to make request with account rotation
             let lastError: Error | null = null;
             let lastResponse: Response | null = null;
@@ -129,10 +184,13 @@ export async function activate(context: PluginContext): Promise<PluginActivation
             while (attempts < maxAttempts) {
                 attempts++;
 
-                // Get account with automatic rotation
+                // Get account with full Antigravity-Manager logic:
+                // - Session stickiness (same conversation uses same account)
+                // - 60s global lock (non-image requests reuse account)
+                // - Tier priority (ULTRA > PRO > FREE)
                 let accountInfo: { accessToken: string; projectId: string; account: ManagedAccount; headerStyle: HeaderStyle };
                 try {
-                    accountInfo = await tokenStore.getValidAccessTokenForFamily(modelFamily);
+                    accountInfo = await tokenStore.getValidAccessTokenForRequest(modelFamily, sessionId, isImage);
                 } catch (error) {
                     // All accounts rate limited or no accounts
                     throw error;
@@ -140,7 +198,7 @@ export async function activate(context: PluginContext): Promise<PluginActivation
 
                 const { accessToken, projectId, account, headerStyle } = accountInfo;
 
-                logger.info(`URL model: ${urlModel}, family: ${modelFamily}, headerStyle: ${headerStyle}, account: ${account.index} (${account.email || 'unknown'})`);
+                logger.info(`URL model: ${urlModel}, family: ${modelFamily}, headerStyle: ${headerStyle}, account: ${account.index} (${account.email || 'unknown'}), session: ${sessionId?.slice(0, 12) || 'none'}, isImage: ${isImage}`);
 
                 // Try endpoints with fallback
                 for (const endpoint of ANTIGRAVITY_ENDPOINTS) {
@@ -178,7 +236,6 @@ export async function activate(context: PluginContext): Promise<PluginActivation
                             }
 
                             // Determine request type for quota tracking
-                            const isImage = isImageModel(urlModel);
                             const requestType: RequestType = isImage ? 'image_gen' : (modelFamily === 'claude' ? 'claude' : 'gemini');
 
                             logger.warn(`Rate limited at ${endpoint}, account ${account.index}, reason=${rateLimitReason}, requestType=${requestType}, retry after ${retryAfterMs}ms`);
