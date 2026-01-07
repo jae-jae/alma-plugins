@@ -7,7 +7,7 @@
 
 import type { AntigravityTokens } from './types';
 import { refreshTokens, isTokenExpired } from './auth';
-import { AccountManager, type ManagedAccount, type ModelFamily, type HeaderStyle, type AccountStorageData } from './account-manager';
+import { AccountManager, type ManagedAccount, type ModelFamily, type HeaderStyle, type AccountStorageData, type RequestType, type RateLimitReason } from './account-manager';
 
 // Storage keys
 const ACCOUNTS_STORAGE_KEY = 'antigravity_accounts';
@@ -223,11 +223,13 @@ export class TokenStore {
      */
     async markRateLimited(
         account: ManagedAccount,
-        retryAfterMs: number,
+        retryAfterMs: number | undefined,
         family: ModelFamily,
-        headerStyle: HeaderStyle = 'antigravity'
+        headerStyle: HeaderStyle = 'antigravity',
+        requestType?: RequestType,
+        reason: RateLimitReason = 'unknown'
     ): Promise<void> {
-        this.accountManager.markRateLimited(account, retryAfterMs, family, headerStyle);
+        this.accountManager.markRateLimited(account, retryAfterMs, family, headerStyle, requestType, reason);
         await this.saveAccounts();
     }
 

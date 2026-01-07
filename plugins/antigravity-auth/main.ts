@@ -17,7 +17,8 @@ import type { PluginContext, PluginActivation } from 'alma-plugin-api';
 import { TokenStore } from './lib/token-store';
 import { getAuthorizationUrl, exchangeCodeForTokens } from './lib/auth';
 import { ANTIGRAVITY_MODELS, getModelFamily, isClaudeThinkingModel, isImageModel, parseImageAspectRatio } from './lib/models';
-import type { ManagedAccount, ModelFamily, HeaderStyle } from './lib/account-manager';
+import type { ManagedAccount, ModelFamily, HeaderStyle, RequestType } from './lib/account-manager';
+import { parseRateLimitReason, parseRetryDelay } from './lib/account-manager';
 import {
     isGenerativeLanguageRequest,
     transformRequest,
@@ -167,11 +168,31 @@ export async function activate(context: PluginContext): Promise<PluginActivation
 
                         // Handle rate limiting - mark account and retry with next
                         if (response.status === HTTP_STATUS.TOO_MANY_REQUESTS) {
-                            const retryAfterMs = parseRetryAfter(response);
-                            logger.warn(`Rate limited at ${endpoint}, account ${account.index}, retry after ${retryAfterMs}ms`);
+                            const errorText = await response.clone().text();
+                            const rateLimitReason = parseRateLimitReason(errorText);
 
-                            // Mark this account as rate limited for this family/headerStyle
-                            await tokenStore.markRateLimited(account, retryAfterMs, modelFamily, headerStyle);
+                            // Try to parse retry delay from error body first, then fall back to header
+                            let retryAfterMs = parseRetryDelay(errorText);
+                            if (retryAfterMs === undefined) {
+                                retryAfterMs = parseRetryAfter(response);
+                            }
+
+                            // Determine request type for quota tracking
+                            const isImage = isImageModel(urlModel);
+                            const requestType: RequestType = isImage ? 'image_gen' : (modelFamily === 'claude' ? 'claude' : 'gemini');
+
+                            logger.warn(`Rate limited at ${endpoint}, account ${account.index}, reason=${rateLimitReason}, requestType=${requestType}, retry after ${retryAfterMs}ms`);
+
+                            // Mark this account as rate limited for this family/headerStyle/requestType
+                            // For QUOTA_EXHAUSTED, use default (1 hour), for others use parsed or header value
+                            await tokenStore.markRateLimited(
+                                account,
+                                rateLimitReason === 'quota_exhausted' ? undefined : retryAfterMs,
+                                modelFamily,
+                                headerStyle,
+                                requestType,
+                                rateLimitReason
+                            );
 
                             // If we have more accounts, try next one
                             if (!tokenStore.getAccountManager().allAccountsRateLimited(modelFamily)) {

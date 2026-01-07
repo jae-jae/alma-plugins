@@ -15,7 +15,19 @@ import type { AntigravityTokens } from './types';
 
 export type ModelFamily = 'claude' | 'gemini';
 export type HeaderStyle = 'antigravity' | 'gemini-cli';
-export type QuotaKey = 'claude' | 'gemini-antigravity' | 'gemini-cli';
+export type RequestType = 'claude' | 'gemini' | 'image_gen';
+export type QuotaKey = 'claude' | 'gemini-antigravity' | 'gemini-cli' | 'gemini-image';
+
+// Rate limit reason types (matching Antigravity-Manager)
+export type RateLimitReason = 'quota_exhausted' | 'rate_limit_exceeded' | 'server_error' | 'unknown';
+
+// Default cooldown times in ms (matching Antigravity-Manager)
+export const RATE_LIMIT_DEFAULTS = {
+    quota_exhausted: 60 * 60 * 1000,     // 1 hour for quota exhaustion
+    rate_limit_exceeded: 30 * 1000,       // 30 seconds for rate limiting
+    server_error: 20 * 1000,              // 20 seconds for server errors
+    unknown: 60 * 1000,                   // 60 seconds for unknown errors
+} as const;
 
 export interface ManagedAccount {
     index: number;
@@ -56,11 +68,97 @@ function nowMs(): number {
     return Date.now();
 }
 
-function getQuotaKey(family: ModelFamily, headerStyle: HeaderStyle): QuotaKey {
+function getQuotaKey(family: ModelFamily, headerStyle: HeaderStyle, requestType?: RequestType): QuotaKey {
     if (family === 'claude') {
         return 'claude';
     }
+    // Image generation has separate quota from text generation
+    if (requestType === 'image_gen') {
+        return 'gemini-image';
+    }
     return headerStyle === 'gemini-cli' ? 'gemini-cli' : 'gemini-antigravity';
+}
+
+/**
+ * Parse rate limit reason from error response body
+ * Matches Antigravity-Manager's parse_rate_limit_reason logic
+ */
+export function parseRateLimitReason(errorBody: string): RateLimitReason {
+    try {
+        const json = JSON.parse(errorBody);
+        const details = json?.error?.details;
+        if (Array.isArray(details) && details.length > 0) {
+            const reason = details[0]?.reason;
+            if (reason === 'QUOTA_EXHAUSTED') {
+                return 'quota_exhausted';
+            }
+            if (reason === 'RATE_LIMIT_EXCEEDED') {
+                return 'rate_limit_exceeded';
+            }
+        }
+    } catch {
+        // JSON parse failed, try text matching
+    }
+
+    // Fallback to text matching
+    const lowerBody = errorBody.toLowerCase();
+    if (lowerBody.includes('exhausted') || lowerBody.includes('quota')) {
+        return 'quota_exhausted';
+    }
+    if (lowerBody.includes('rate limit') || lowerBody.includes('too many requests')) {
+        return 'rate_limit_exceeded';
+    }
+
+    return 'unknown';
+}
+
+/**
+ * Parse retry delay from error response (matches Antigravity-Manager)
+ */
+export function parseRetryDelay(errorBody: string): number | undefined {
+    try {
+        const json = JSON.parse(errorBody);
+        const details = json?.error?.details;
+        if (Array.isArray(details)) {
+            for (const detail of details) {
+                // Check quotaResetDelay in metadata
+                const quotaDelay = detail?.metadata?.quotaResetDelay;
+                if (typeof quotaDelay === 'string') {
+                    const parsed = parseDurationString(quotaDelay);
+                    if (parsed !== undefined) return parsed;
+                }
+
+                // Check retryDelay in RetryInfo
+                if (detail?.['@type']?.includes('RetryInfo')) {
+                    const retryDelay = detail?.retryDelay;
+                    if (typeof retryDelay === 'string') {
+                        const parsed = parseDurationString(retryDelay);
+                        if (parsed !== undefined) return parsed;
+                    }
+                }
+            }
+        }
+    } catch {
+        // JSON parse failed
+    }
+    return undefined;
+}
+
+/**
+ * Parse duration string like "2h1m30s", "42s", "500ms"
+ */
+function parseDurationString(s: string): number | undefined {
+    const regex = /(?:(\d+)h)?(?:(\d+)m)?(?:(\d+(?:\.\d+)?)s)?(?:(\d+)ms)?/;
+    const match = s.match(regex);
+    if (!match) return undefined;
+
+    const hours = parseInt(match[1] || '0', 10);
+    const minutes = parseInt(match[2] || '0', 10);
+    const seconds = parseFloat(match[3] || '0');
+    const milliseconds = parseInt(match[4] || '0', 10);
+
+    const totalMs = (hours * 3600 + minutes * 60 + Math.ceil(seconds)) * 1000 + milliseconds;
+    return totalMs > 0 ? totalMs : undefined;
 }
 
 function isRateLimitedForQuotaKey(account: ManagedAccount, key: QuotaKey): boolean {
@@ -339,16 +437,26 @@ export class AccountManager {
 
     /**
      * Mark an account as rate limited
+     * @param account The account to mark
+     * @param retryAfterMs The retry delay (if undefined, uses defaults based on reason)
+     * @param family Model family (claude/gemini)
+     * @param headerStyle Header style for Gemini
+     * @param requestType Request type (claude/gemini/image_gen) - used for separate image quota
+     * @param reason Rate limit reason for determining default cooldown
      */
     markRateLimited(
         account: ManagedAccount,
-        retryAfterMs: number,
+        retryAfterMs: number | undefined,
         family: ModelFamily,
-        headerStyle: HeaderStyle = 'antigravity'
+        headerStyle: HeaderStyle = 'antigravity',
+        requestType?: RequestType,
+        reason: RateLimitReason = 'unknown'
     ): void {
-        const key = getQuotaKey(family, headerStyle);
-        account.rateLimitResetTimes[key] = nowMs() + retryAfterMs;
-        this.logger?.info(`Account ${account.index} (${account.email || 'unknown'}) rate limited for ${key}, retry after ${retryAfterMs}ms`);
+        const key = getQuotaKey(family, headerStyle, requestType);
+        // Use provided delay or fall back to reason-based defaults
+        const delay = retryAfterMs ?? RATE_LIMIT_DEFAULTS[reason];
+        account.rateLimitResetTimes[key] = nowMs() + delay;
+        this.logger?.info(`Account ${account.index} (${account.email || 'unknown'}) rate limited for ${key} (${reason}), retry after ${delay}ms`);
     }
 
     /**
