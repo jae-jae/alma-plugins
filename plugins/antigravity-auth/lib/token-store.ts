@@ -3,11 +3,20 @@
  *
  * Manages storage and retrieval of OAuth tokens using the plugin's secret storage.
  * Supports multiple accounts with automatic rotation via AccountManager.
+ *
+ * This implementation matches Antigravity-Manager's token_manager.rs exactly.
  */
 
 import type { AntigravityTokens } from './types';
 import { refreshTokens, isTokenExpired } from './auth';
-import { AccountManager, type ManagedAccount, type ModelFamily, type HeaderStyle, type AccountStorageData, type RequestType, type RateLimitReason } from './account-manager';
+import {
+    AccountManager,
+    GLOBAL_LOCK_DURATION_MS,
+    type ManagedAccount,
+    type ModelFamily,
+    type HeaderStyle,
+    type AccountStorageData,
+} from './account-manager';
 import { fetchQuota, type QuotaData } from './quota';
 
 // Storage keys
@@ -57,7 +66,6 @@ export class TokenStore {
             if (stored) {
                 const data = JSON.parse(stored) as AccountStorageData;
                 this.accountManager.loadFromStorage(data);
-                this.logger.info(`Loaded ${this.accountManager.getAccountCount()} Antigravity account(s)`);
             }
         } catch (error) {
             this.logger.warn('Failed to load cached accounts:', error);
@@ -121,6 +129,9 @@ export class TokenStore {
         while (this.accountManager.getAccountCount() > 0) {
             this.accountManager.removeAccount(0);
         }
+        this.accountManager.clearAllRateLimits();
+        this.accountManager.clearSessionBindings();
+        this.accountManager.clearLastUsedAccount();
         await this.secrets.delete(ACCOUNTS_STORAGE_KEY);
         await this.secrets.delete(PENDING_VERIFIER_KEY);
         await this.secrets.delete(PENDING_STATE_KEY);
@@ -128,51 +139,212 @@ export class TokenStore {
     }
 
     /**
-     * Get valid access token for a request with full Antigravity-Manager logic:
-     * - Session stickiness: same session uses same account
-     * - 60s global lock: non-image requests reuse account within 60s
-     * - Tier priority: ULTRA > PRO > FREE
+     * Get valid access token for a request with full Antigravity-Manager logic.
+     * Matches Antigravity-Manager's get_token_internal exactly:
+     * 1. Session stickiness: if session is bound to an account, use it
+     * 2. 60s global lock: for non-image requests, reuse same account within 60s
+     * 3. Round-robin: select next account using atomic index
+     * 4. Retry loop: if token refresh fails, try next account
+     * 5. Tier priority: ULTRA > PRO > FREE
      *
      * @param family Model family (claude/gemini)
      * @param sessionId Optional session ID for conversation stickiness
      * @param isImageRequest Whether this is an image generation request
+     * @param forceRotate Force rotate to next account (used on retry)
      */
     async getValidAccessTokenForRequest(
         family: ModelFamily,
         sessionId?: string,
-        isImageRequest: boolean = false
+        isImageRequest: boolean = false,
+        forceRotate: boolean = false
     ): Promise<{ accessToken: string; projectId: string; account: ManagedAccount; headerStyle: HeaderStyle }> {
-        const account = this.accountManager.getAccountForRequest(family, sessionId, isImageRequest);
+        // Get tier-sorted accounts snapshot
+        const sortedAccounts = this.accountManager.getSortedAccountsSnapshot();
+        const total = sortedAccounts.length;
 
-        if (!account) {
-            if (this.accountManager.getAccountCount() === 0) {
-                throw new Error('Not authenticated. Please login first.');
+        if (total === 0) {
+            throw new Error('Not authenticated. Please login first.');
+        }
+
+        // Get last used account info for 60s lock (for non-image requests)
+        const lastUsedInfo = !isImageRequest ? this.accountManager.getLastUsedAccount() : null;
+
+        const attempted = new Set<string>();
+        let lastError: string | undefined;
+        let needUpdateLastUsed: { accountIndex: number; clear: boolean } | null = null;
+
+        // Retry loop (matches Antigravity-Manager's for attempt in 0..total)
+        for (let attempt = 0; attempt < total; attempt++) {
+            const rotate = forceRotate || attempt > 0;
+            let targetAccount: ManagedAccount | null = null;
+
+            // Mode A: Sticky session handling
+            if (!rotate && sessionId) {
+                const boundAccount = this.accountManager.getAccountForSession(sessionId);
+                if (boundAccount) {
+                    const accountId = boundAccount.email || String(boundAccount.index);
+                    const resetSec = this.accountManager.getRemainingWait(accountId);
+
+                    if (resetSec > 0) {
+                        // Account is rate-limited, unbind and switch
+                        this.logger.warn(
+                            `Session ${sessionId.slice(0, 8)}... bound account ${accountId} is rate-limited (${resetSec}s remaining). Unbinding.`
+                        );
+                        this.accountManager.unbindSession(sessionId);
+                    } else if (!attempted.has(accountId)) {
+                        // Reuse bound account
+                        this.logger.debug(`Sticky Session: Reusing bound account ${accountId} for session ${sessionId.slice(0, 8)}...`);
+                        targetAccount = boundAccount;
+                    }
+                }
             }
-            // All accounts are rate limited
-            const waitTime = this.accountManager.getMinWaitTime(family);
-            throw new Error(`All accounts are rate limited. Please wait ${Math.ceil(waitTime / 1000)} seconds.`);
+
+            // Mode B: 60s global lock (skip for image requests)
+            if (!targetAccount && !rotate && !isImageRequest) {
+                // Check if we can reuse last used account within 60s window
+                if (lastUsedInfo) {
+                    const elapsed = Date.now() - lastUsedInfo.timestamp;
+                    if (elapsed < GLOBAL_LOCK_DURATION_MS) {
+                        const lastAccount = this.accountManager.getAccountByIndex(lastUsedInfo.accountIndex);
+                        if (lastAccount) {
+                            const accountId = lastAccount.email || String(lastAccount.index);
+                            if (!attempted.has(accountId) && !this.accountManager.isRateLimited(accountId)) {
+                                this.logger.debug(`60s Window: Reusing last account ${accountId}`);
+                                targetAccount = lastAccount;
+                            }
+                        }
+                    }
+                }
+
+                // If no locked account, use round-robin
+                if (!targetAccount) {
+                    targetAccount = this.accountManager.selectNextAccount(sortedAccounts, attempted, true);
+                    if (targetAccount) {
+                        needUpdateLastUsed = { accountIndex: targetAccount.index, clear: false };
+
+                        // Bind session if provided
+                        if (sessionId) {
+                            this.accountManager.bindSession(sessionId, targetAccount.index);
+                            this.logger.debug(
+                                `Sticky Session: Bound new account ${targetAccount.email || targetAccount.index} to session ${sessionId.slice(0, 8)}...`
+                            );
+                        }
+                    }
+                }
+            } else if (!targetAccount) {
+                // Mode C: Pure round-robin (for image requests or force rotate)
+                targetAccount = this.accountManager.selectNextAccount(sortedAccounts, attempted, true);
+
+                if (targetAccount && rotate) {
+                    this.logger.debug(`Force Rotation: Switched to account ${targetAccount.email || targetAccount.index}`);
+                }
+            }
+
+            // No available account
+            if (!targetAccount) {
+                const minWait = this.accountManager.getMinWaitTime();
+                throw new Error(`All accounts are currently limited or unhealthy. Please wait ${minWait}s.`);
+            }
+
+            const accountId = targetAccount.email || String(targetAccount.index);
+
+            // 3. Check if token needs refresh (refresh 5 minutes before expiry)
+            const now = Date.now();
+            const needsRefresh = !targetAccount.accessToken ||
+                !targetAccount.expiresAt ||
+                now >= targetAccount.expiresAt - 5 * 60 * 1000;
+
+            if (needsRefresh) {
+                this.logger.debug(`Token for account ${accountId} needs refresh...`);
+
+                try {
+                    await this.refreshAccountTokenInternal(targetAccount);
+                } catch (error) {
+                    const errorMessage = error instanceof Error ? error.message : String(error);
+                    this.logger.error(`Token refresh failed for ${accountId}: ${errorMessage}`);
+
+                    // Check for invalid_grant - disable account
+                    if (errorMessage.includes('invalid_grant')) {
+                        this.logger.error(`Disabling account ${accountId} due to invalid_grant`);
+                        this.accountManager.disableAccount(targetAccount, `invalid_grant: ${errorMessage}`);
+                        await this.saveAccounts();
+                    }
+
+                    lastError = `Token refresh failed: ${errorMessage}`;
+                    attempted.add(accountId);
+
+                    // Clear last used if this was the locked account
+                    if (!isImageRequest && lastUsedInfo?.accountIndex === targetAccount.index) {
+                        needUpdateLastUsed = { accountIndex: 0, clear: true };
+                    }
+
+                    continue; // Try next account
+                }
+            }
+
+            // 4. Ensure we have project_id (should always be present from OAuth)
+            if (!targetAccount.projectId) {
+                this.logger.error(`Account ${accountId} missing project_id`);
+                lastError = `Account ${accountId} missing project_id`;
+                attempted.add(accountId);
+                continue;
+            }
+
+            // Update last used account (if needed)
+            if (needUpdateLastUsed) {
+                if (needUpdateLastUsed.clear) {
+                    this.accountManager.clearLastUsedAccount();
+                } else {
+                    this.accountManager.updateLastUsedAccount(needUpdateLastUsed.accountIndex);
+                }
+            } else if (!isImageRequest && targetAccount) {
+                // Always update last used for non-image requests
+                this.accountManager.updateLastUsedAccount(targetAccount.index);
+            }
+
+            // Update lastUsed timestamp
+            targetAccount.lastUsed = now;
+
+            // Save any updates
+            await this.saveAccounts();
+
+            return {
+                accessToken: targetAccount.accessToken!,
+                projectId: targetAccount.projectId,
+                account: targetAccount,
+                headerStyle: 'antigravity', // Default header style
+            };
         }
 
-        // Determine header style (for Gemini, try both quota pools)
-        const headerStyle = this.accountManager.getAvailableHeaderStyle(account, family) || 'antigravity';
+        // All accounts failed
+        throw new Error(lastError || 'All accounts failed');
+    }
 
-        // Check if token needs refresh
-        if (!account.accessToken || !account.expiresAt || isTokenExpired(account.expiresAt)) {
-            await this.refreshAccountToken(account);
-        }
+    /**
+     * Internal token refresh without promise deduplication (used in retry loop)
+     */
+    private async refreshAccountTokenInternal(account: ManagedAccount): Promise<void> {
+        this.logger.info(`Refreshing token for account ${account.index} (${account.email || 'unknown'})...`);
 
-        return {
-            accessToken: account.accessToken!,
-            projectId: account.projectId,
+        const newTokens = await refreshTokens(account.refreshToken, account.projectId);
+
+        // Update account with new tokens
+        this.accountManager.updateAccountTokens(
             account,
-            headerStyle,
-        };
+            newTokens.access_token,
+            newTokens.expires_at
+        );
+
+        // Update refresh token if it changed
+        if (newTokens.refresh_token !== account.refreshToken) {
+            account.refreshToken = newTokens.refresh_token;
+        }
+
+        this.logger.info(`Successfully refreshed token for account ${account.index}`);
     }
 
     /**
      * Get valid access token for a model family.
-     * Automatically rotates to next account if current is rate limited.
-     *
      * @deprecated Use getValidAccessTokenForRequest() for full Antigravity-Manager logic
      */
     async getValidAccessTokenForFamily(family: ModelFamily): Promise<{ accessToken: string; projectId: string; account: ManagedAccount; headerStyle: HeaderStyle }> {
@@ -188,69 +360,30 @@ export class TokenStore {
     }
 
     /**
-     * Refresh token for a specific account
-     */
-    private async refreshAccountToken(account: ManagedAccount): Promise<void> {
-        // If already refreshing this account, wait for that to complete
-        const existingPromise = this.refreshPromises.get(account.index);
-        if (existingPromise) {
-            await existingPromise;
-            return;
-        }
-
-        const refreshPromise = this.doRefreshAccount(account);
-        this.refreshPromises.set(account.index, refreshPromise);
-
-        try {
-            await refreshPromise;
-        } finally {
-            this.refreshPromises.delete(account.index);
-        }
-    }
-
-    /**
-     * Perform the actual token refresh for an account
-     */
-    private async doRefreshAccount(account: ManagedAccount): Promise<ManagedAccount> {
-        this.logger.info(`Refreshing token for account ${account.index} (${account.email || 'unknown'})...`);
-
-        try {
-            const newTokens = await refreshTokens(account.refreshToken, account.projectId);
-
-            // Update account with new tokens
-            this.accountManager.updateAccountTokens(
-                account,
-                newTokens.access_token,
-                newTokens.expires_at
-            );
-
-            // Update refresh token if it changed
-            if (newTokens.refresh_token !== account.refreshToken) {
-                account.refreshToken = newTokens.refresh_token;
-            }
-
-            await this.saveAccounts();
-            this.logger.info(`Successfully refreshed token for account ${account.index}`);
-            return account;
-        } catch (error) {
-            this.logger.error(`Failed to refresh token for account ${account.index}:`, error);
-            // Don't remove account on refresh failure - might be temporary
-            throw new Error(`Token refresh failed for account ${account.email || account.index}. Please re-authenticate.`);
-        }
-    }
-
-    /**
-     * Mark an account as rate limited
+     * Mark an account as rate limited.
+     * Matches Antigravity-Manager's mark_rate_limited.
+     *
+     * @param account The account to mark
+     * @param status HTTP status code (429, 500, 503, 529)
+     * @param retryAfterHeader Retry-After header value
+     * @param errorBody Error response body
      */
     async markRateLimited(
         account: ManagedAccount,
-        retryAfterMs: number | undefined,
-        family: ModelFamily,
-        headerStyle: HeaderStyle = 'antigravity',
-        requestType?: RequestType,
-        reason: RateLimitReason = 'unknown'
+        status: number,
+        retryAfterHeader: string | undefined,
+        errorBody: string
     ): Promise<void> {
-        this.accountManager.markRateLimited(account, retryAfterMs, family, headerStyle, requestType, reason);
+        const accountId = account.email || String(account.index);
+        this.accountManager.markRateLimited(accountId, status, retryAfterHeader, errorBody);
+        await this.saveAccounts();
+    }
+
+    /**
+     * Clear all rate limits
+     */
+    async clearAllRateLimits(): Promise<void> {
+        this.accountManager.clearAllRateLimits();
         await this.saveAccounts();
     }
 
@@ -287,13 +420,13 @@ export class TokenStore {
         isRateLimited?: boolean;
         rateLimitResetAt?: number;
         quota?: QuotaData;
+        subscriptionTier?: string;
     }> {
         return this.accountManager.getAccounts().map(a => {
-            // Check if rate limited for any family
-            const now = Date.now();
-            const resetTimes = Object.values(a.rateLimitResetTimes).filter((t): t is number => t !== undefined && t > now);
-            const isRateLimited = resetTimes.length > 0;
-            const rateLimitResetAt = isRateLimited ? Math.min(...resetTimes) : undefined;
+            const accountId = a.email || String(a.index);
+            const resetSeconds = this.accountManager.getResetSeconds(accountId);
+            const isRateLimited = resetSeconds !== undefined && resetSeconds > 0;
+            const rateLimitResetAt = isRateLimited ? Date.now() + resetSeconds * 1000 : undefined;
 
             return {
                 index: a.index,
@@ -302,6 +435,7 @@ export class TokenStore {
                 isRateLimited,
                 rateLimitResetAt,
                 quota: a.quota,
+                subscriptionTier: a.subscriptionTier,
             };
         });
     }
@@ -314,7 +448,8 @@ export class TokenStore {
             // Ensure we have a valid access token
             if (!account.accessToken || !account.expiresAt || isTokenExpired(account.expiresAt)) {
                 this.logger.info(`Refreshing token for account ${account.index} (${account.email || 'unknown'})...`);
-                await this.refreshAccountToken(account);
+                await this.refreshAccountTokenInternal(account);
+                await this.saveAccounts();
             }
 
             if (!account.accessToken) {

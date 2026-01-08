@@ -2,9 +2,7 @@
  * Multi-Account Manager for Antigravity Auth
  *
  * Manages multiple Google accounts with automatic rotation on rate limits.
- * Each account tracks rate limits separately per model family (claude/gemini).
- *
- * Based on opencode-antigravity-auth's accounts.ts
+ * This implementation matches Antigravity-Manager's token_manager.rs exactly.
  */
 
 import type { AntigravityTokens } from './types';
@@ -17,7 +15,6 @@ import type { QuotaData } from './quota';
 export type ModelFamily = 'claude' | 'gemini';
 export type HeaderStyle = 'antigravity' | 'gemini-cli';
 export type RequestType = 'claude' | 'gemini' | 'image_gen';
-export type QuotaKey = 'claude' | 'gemini-antigravity' | 'gemini-cli' | 'gemini-image';
 
 // Rate limit reason types (matching Antigravity-Manager)
 export type RateLimitReason = 'quota_exhausted' | 'rate_limit_exceeded' | 'server_error' | 'unknown';
@@ -36,6 +33,14 @@ export const RATE_LIMIT_DEFAULTS = {
 // 60s global lock duration (matching Antigravity-Manager)
 export const GLOBAL_LOCK_DURATION_MS = 60 * 1000;
 
+// Rate limit info (matching Antigravity-Manager's RateLimitInfo)
+export interface RateLimitInfo {
+    resetTime: number;      // timestamp in ms
+    retryAfterMs: number;
+    detectedAt: number;
+    reason: RateLimitReason;
+}
+
 export interface ManagedAccount {
     index: number;
     email?: string;
@@ -45,14 +50,14 @@ export interface ManagedAccount {
     expiresAt?: number;
     addedAt: number;
     lastUsed: number;
-    /** Rate limit reset times per quota key */
-    rateLimitResetTimes: Partial<Record<QuotaKey, number>>;
-    /** Last switch reason */
-    lastSwitchReason?: 'rate-limit' | 'initial' | 'rotation';
     /** Subscription tier (ULTRA > PRO > FREE) for priority sorting */
     subscriptionTier?: SubscriptionTier;
     /** Real quota data from API */
     quota?: QuotaData;
+    /** Whether account is disabled (e.g., due to invalid_grant) */
+    disabled?: boolean;
+    /** Reason for disabling */
+    disabledReason?: string;
 }
 
 export interface AccountStorageData {
@@ -63,14 +68,20 @@ export interface AccountStorageData {
         refreshToken: string;
         addedAt: number;
         lastUsed: number;
-        rateLimitResetTimes?: Partial<Record<QuotaKey, number>>;
         subscriptionTier?: SubscriptionTier;
         quota?: QuotaData;
+        disabled?: boolean;
+        disabledReason?: string;
     }>;
-    activeIndexByFamily: {
-        claude: number;
-        gemini: number;
-    };
+    currentIndex: number;
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+function nowMs(): number {
+    return Date.now();
 }
 
 /**
@@ -84,34 +95,6 @@ function getTierPriority(tier: SubscriptionTier | undefined): number {
         case 'FREE': return 2;
         default: return 3;
     }
-}
-
-/**
- * Sort accounts by subscription tier priority (ULTRA > PRO > FREE)
- */
-function sortAccountsByTier(accounts: ManagedAccount[]): ManagedAccount[] {
-    return [...accounts].sort((a, b) =>
-        getTierPriority(a.subscriptionTier) - getTierPriority(b.subscriptionTier)
-    );
-}
-
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
-function nowMs(): number {
-    return Date.now();
-}
-
-function getQuotaKey(family: ModelFamily, headerStyle: HeaderStyle, requestType?: RequestType): QuotaKey {
-    if (family === 'claude') {
-        return 'claude';
-    }
-    // Image generation has separate quota from text generation
-    if (requestType === 'image_gen') {
-        return 'gemini-image';
-    }
-    return headerStyle === 'gemini-cli' ? 'gemini-cli' : 'gemini-antigravity';
 }
 
 /**
@@ -148,6 +131,24 @@ export function parseRateLimitReason(errorBody: string): RateLimitReason {
 }
 
 /**
+ * Parse duration string like "2h1m30s", "42s", "500ms"
+ * Matches Antigravity-Manager's parse_duration_string
+ */
+function parseDurationString(s: string): number | undefined {
+    const regex = /(?:(\d+)h)?(?:(\d+)m)?(?:(\d+(?:\.\d+)?)s)?(?:(\d+)ms)?/;
+    const match = s.match(regex);
+    if (!match) return undefined;
+
+    const hours = parseInt(match[1] || '0', 10);
+    const minutes = parseInt(match[2] || '0', 10);
+    const seconds = parseFloat(match[3] || '0');
+    const milliseconds = parseInt(match[4] || '0', 10);
+
+    const totalMs = (hours * 3600 + minutes * 60 + Math.ceil(seconds)) * 1000 + milliseconds;
+    return totalMs > 0 ? totalMs : undefined;
+}
+
+/**
  * Parse retry delay from error response (matches Antigravity-Manager)
  */
 export function parseRetryDelay(errorBody: string): number | undefined {
@@ -173,144 +174,94 @@ export function parseRetryDelay(errorBody: string): number | undefined {
                 }
             }
         }
+
+        // OpenAI style retry_after
+        const retryAfter = json?.error?.retry_after;
+        if (typeof retryAfter === 'number') {
+            return retryAfter * 1000;
+        }
     } catch {
         // JSON parse failed
     }
+
+    // Regex fallback patterns (matching Antigravity-Manager)
+    const patterns = [
+        /try again in (\d+)m\s*(\d+)s/i,
+        /(?:try again in|backoff for|wait)\s*(\d+)s/i,
+        /quota will reset in (\d+) second/i,
+        /retry after (\d+) second/i,
+        /\(wait (\d+)s\)/,
+    ];
+
+    for (const pattern of patterns) {
+        const match = errorBody.match(pattern);
+        if (match) {
+            if (match[2]) {
+                // Minutes and seconds format
+                return (parseInt(match[1], 10) * 60 + parseInt(match[2], 10)) * 1000;
+            }
+            return parseInt(match[1], 10) * 1000;
+        }
+    }
+
     return undefined;
 }
 
-/**
- * Parse duration string like "2h1m30s", "42s", "500ms"
- */
-function parseDurationString(s: string): number | undefined {
-    const regex = /(?:(\d+)h)?(?:(\d+)m)?(?:(\d+(?:\.\d+)?)s)?(?:(\d+)ms)?/;
-    const match = s.match(regex);
-    if (!match) return undefined;
-
-    const hours = parseInt(match[1] || '0', 10);
-    const minutes = parseInt(match[2] || '0', 10);
-    const seconds = parseFloat(match[3] || '0');
-    const milliseconds = parseInt(match[4] || '0', 10);
-
-    const totalMs = (hours * 3600 + minutes * 60 + Math.ceil(seconds)) * 1000 + milliseconds;
-    return totalMs > 0 ? totalMs : undefined;
-}
-
-function isRateLimitedForQuotaKey(account: ManagedAccount, key: QuotaKey): boolean {
-    const resetTime = account.rateLimitResetTimes[key];
-    return resetTime !== undefined && nowMs() < resetTime;
-}
-
-function isRateLimitedForFamily(account: ManagedAccount, family: ModelFamily): boolean {
-    if (family === 'claude') {
-        return isRateLimitedForQuotaKey(account, 'claude');
-    }
-    // For Gemini, check both header styles
-    return isRateLimitedForQuotaKey(account, 'gemini-antigravity') &&
-           isRateLimitedForQuotaKey(account, 'gemini-cli');
-}
-
-function clearExpiredRateLimits(account: ManagedAccount): void {
-    const now = nowMs();
-    for (const key of Object.keys(account.rateLimitResetTimes) as QuotaKey[]) {
-        const resetTime = account.rateLimitResetTimes[key];
-        if (resetTime !== undefined && now >= resetTime) {
-            delete account.rateLimitResetTimes[key];
-        }
-    }
-}
-
 // ============================================================================
-// Session and Global Lock Types
+// AccountManager Class (matching Antigravity-Manager's TokenManager)
 // ============================================================================
 
-interface LastUsedInfo {
-    accountIndex: number;
-    timestamp: number;
-    family: ModelFamily;
-}
-
-// ============================================================================
-// AccountManager Class
-// ============================================================================
-
-/**
- * Multi-account manager with automatic rotation on rate limits.
- *
- * Matches Antigravity-Manager logic:
- * 1. Session stickiness: same session ID always uses same account
- * 2. 60s global lock: non-image requests reuse same account within 60s
- * 3. Tier priority: ULTRA > PRO > FREE when selecting new accounts
- * 4. Rate limit tracking: per quota key (claude, gemini-antigravity, gemini-cli, gemini-image)
- */
 export class AccountManager {
     private accounts: ManagedAccount[] = [];
-    private cursor = 0;
-    private currentAccountIndexByFamily: Record<ModelFamily, number> = {
-        claude: -1,
-        gemini: -1,
-    };
-    private logger?: { debug: (msg: string, ...args: unknown[]) => void; info: (msg: string, ...args: unknown[]) => void };
+    /** Atomic round-robin index (matching Antigravity-Manager's current_index) */
+    private currentIndex = 0;
+    private logger?: { debug: (msg: string, ...args: unknown[]) => void; info: (msg: string, ...args: unknown[]) => void; warn: (msg: string, ...args: unknown[]) => void };
+
+    /** Rate limit tracker per account_id (matching Antigravity-Manager) */
+    private rateLimits: Map<string, RateLimitInfo> = new Map();
 
     /** Session fingerprint -> account index binding (for conversation stickiness) */
     private sessionBindings: Map<string, number> = new Map();
 
     /** Last used account info for 60s global lock (non-image requests) */
-    private lastUsedInfo: LastUsedInfo | null = null;
+    private lastUsedAccount: { accountIndex: number; timestamp: number } | null = null;
 
     constructor(
-        logger?: { debug: (msg: string, ...args: unknown[]) => void; info: (msg: string, ...args: unknown[]) => void }
+        logger?: { debug: (msg: string, ...args: unknown[]) => void; info: (msg: string, ...args: unknown[]) => void; warn: (msg: string, ...args: unknown[]) => void }
     ) {
         this.logger = logger;
     }
 
-    /**
-     * Load accounts from storage data
-     */
+    // =========================================================================
+    // Storage Operations
+    // =========================================================================
+
     loadFromStorage(data: AccountStorageData | null): void {
         if (!data || data.accounts.length === 0) {
             this.accounts = [];
-            this.cursor = 0;
-            this.currentAccountIndexByFamily = { claude: -1, gemini: -1 };
+            this.currentIndex = 0;
             return;
         }
 
-        this.accounts = data.accounts.map((acc, index): ManagedAccount => ({
-            index,
-            email: acc.email,
-            projectId: acc.projectId,
-            refreshToken: acc.refreshToken,
-            addedAt: acc.addedAt,
-            lastUsed: acc.lastUsed,
-            rateLimitResetTimes: acc.rateLimitResetTimes || {},
-            subscriptionTier: acc.subscriptionTier,
-            quota: acc.quota,
-        }));
+        this.accounts = data.accounts
+            .filter(acc => !acc.disabled) // Skip disabled accounts
+            .map((acc, index): ManagedAccount => ({
+                index,
+                email: acc.email,
+                projectId: acc.projectId,
+                refreshToken: acc.refreshToken,
+                addedAt: acc.addedAt,
+                lastUsed: acc.lastUsed,
+                subscriptionTier: acc.subscriptionTier,
+                quota: acc.quota,
+                disabled: acc.disabled,
+                disabledReason: acc.disabledReason,
+            }));
 
-        // Auto-clear expired rate limits on load
-        const now = nowMs();
-        let clearedCount = 0;
-        for (const account of this.accounts) {
-            for (const key of Object.keys(account.rateLimitResetTimes) as QuotaKey[]) {
-                const resetTime = account.rateLimitResetTimes[key];
-                if (resetTime !== undefined && now >= resetTime) {
-                    delete account.rateLimitResetTimes[key];
-                    clearedCount++;
-                }
-            }
-        }
-        if (clearedCount > 0) {
-            this.logger?.info(`Cleared ${clearedCount} expired rate limit(s) on load`);
-        }
-
-        this.currentAccountIndexByFamily.claude = Math.max(0, data.activeIndexByFamily?.claude ?? 0) % Math.max(1, this.accounts.length);
-        this.currentAccountIndexByFamily.gemini = Math.max(0, data.activeIndexByFamily?.gemini ?? 0) % Math.max(1, this.accounts.length);
-        this.cursor = this.currentAccountIndexByFamily.claude;
+        this.currentIndex = data.currentIndex ?? 0;
+        this.logger?.info(`Loaded ${this.accounts.length} Antigravity account(s)`);
     }
 
-    /**
-     * Convert to storage data for persistence
-     */
     toStorageData(): AccountStorageData {
         return {
             version: 1,
@@ -320,22 +271,19 @@ export class AccountManager {
                 refreshToken: acc.refreshToken,
                 addedAt: acc.addedAt,
                 lastUsed: acc.lastUsed,
-                rateLimitResetTimes: Object.keys(acc.rateLimitResetTimes).length > 0
-                    ? acc.rateLimitResetTimes
-                    : undefined,
                 subscriptionTier: acc.subscriptionTier,
                 quota: acc.quota,
+                disabled: acc.disabled,
+                disabledReason: acc.disabledReason,
             })),
-            activeIndexByFamily: {
-                claude: Math.max(0, this.currentAccountIndexByFamily.claude),
-                gemini: Math.max(0, this.currentAccountIndexByFamily.gemini),
-            },
+            currentIndex: this.currentIndex,
         };
     }
 
-    /**
-     * Add a new account from OAuth tokens
-     */
+    // =========================================================================
+    // Account Management
+    // =========================================================================
+
     addAccount(tokens: AntigravityTokens): ManagedAccount {
         // Check if account already exists (by email or refresh token)
         const existing = this.accounts.find(a =>
@@ -350,6 +298,8 @@ export class AccountManager {
             existing.accessToken = tokens.access_token;
             existing.expiresAt = tokens.expires_at;
             existing.email = tokens.email;
+            existing.disabled = false;
+            existing.disabledReason = undefined;
             this.logger?.info(`Updated existing account: ${tokens.email || 'unknown'}`);
             return existing;
         }
@@ -364,118 +314,198 @@ export class AccountManager {
             expiresAt: tokens.expires_at,
             addedAt: nowMs(),
             lastUsed: 0,
-            rateLimitResetTimes: {},
         };
 
         this.accounts.push(account);
-
-        // If this is the first account, set it as active
-        if (this.accounts.length === 1) {
-            this.currentAccountIndexByFamily.claude = 0;
-            this.currentAccountIndexByFamily.gemini = 0;
-        }
-
         this.logger?.info(`Added new account: ${tokens.email || 'unknown'} (total: ${this.accounts.length})`);
         return account;
     }
 
-    /**
-     * Remove an account
-     */
     removeAccount(index: number): boolean {
         if (index < 0 || index >= this.accounts.length) {
             return false;
         }
 
-        this.accounts.splice(index, 1);
+        const removed = this.accounts.splice(index, 1)[0];
 
         // Re-index remaining accounts
         this.accounts.forEach((acc, i) => {
             acc.index = i;
         });
 
-        // Adjust active indices
+        // Clear rate limit for removed account
+        if (removed) {
+            this.rateLimits.delete(removed.email || String(removed.index));
+        }
+
+        // Adjust currentIndex
         if (this.accounts.length === 0) {
-            this.cursor = 0;
-            this.currentAccountIndexByFamily = { claude: -1, gemini: -1 };
+            this.currentIndex = 0;
         } else {
-            for (const family of ['claude', 'gemini'] as ModelFamily[]) {
-                if (this.currentAccountIndexByFamily[family] >= index) {
-                    this.currentAccountIndexByFamily[family] = Math.max(0, this.currentAccountIndexByFamily[family] - 1);
-                }
-                this.currentAccountIndexByFamily[family] = Math.min(
-                    this.currentAccountIndexByFamily[family],
-                    this.accounts.length - 1
-                );
-            }
-            this.cursor = Math.min(this.cursor, this.accounts.length - 1);
+            this.currentIndex = this.currentIndex % this.accounts.length;
         }
 
         return true;
     }
 
     /**
-     * Get account count
+     * Disable account (e.g., due to invalid_grant)
+     * Matches Antigravity-Manager's disable_account
      */
-    getAccountCount(): number {
-        return this.accounts.length;
+    disableAccount(account: ManagedAccount, reason: string): void {
+        account.disabled = true;
+        account.disabledReason = reason;
+        this.logger?.warn(`Disabled account ${account.email || account.index}: ${reason}`);
     }
 
-    /**
-     * Get all accounts
-     */
+    getAccountCount(): number {
+        return this.accounts.filter(a => !a.disabled).length;
+    }
+
     getAccounts(): ManagedAccount[] {
         return [...this.accounts];
     }
 
+    getAccountByIndex(index: number): ManagedAccount | null {
+        return this.accounts[index] ?? null;
+    }
+
+    // =========================================================================
+    // Rate Limit Tracking (matching Antigravity-Manager per account_id)
+    // =========================================================================
+
     /**
-     * Get current account for a model family
+     * Check if account is rate limited
+     * Matches Antigravity-Manager's is_rate_limited
      */
-    getCurrentAccountForFamily(family: ModelFamily): ManagedAccount | null {
-        const index = this.currentAccountIndexByFamily[family];
-        if (index >= 0 && index < this.accounts.length) {
-            return this.accounts[index] ?? null;
+    isRateLimited(accountId: string): boolean {
+        const info = this.rateLimits.get(accountId);
+        if (!info) return false;
+        return info.resetTime > nowMs();
+    }
+
+    /**
+     * Get remaining wait time in seconds
+     * Matches Antigravity-Manager's get_remaining_wait
+     */
+    getRemainingWait(accountId: string): number {
+        const info = this.rateLimits.get(accountId);
+        if (!info) return 0;
+        const remaining = info.resetTime - nowMs();
+        return remaining > 0 ? Math.ceil(remaining / 1000) : 0;
+    }
+
+    /**
+     * Get reset time in seconds for an account
+     * Matches Antigravity-Manager's get_reset_seconds
+     */
+    getResetSeconds(accountId: string): number | undefined {
+        const info = this.rateLimits.get(accountId);
+        if (!info) return undefined;
+        const remaining = info.resetTime - nowMs();
+        return remaining > 0 ? Math.ceil(remaining / 1000) : undefined;
+    }
+
+    /**
+     * Mark account as rate limited
+     * Matches Antigravity-Manager's parse_from_error
+     */
+    markRateLimited(
+        accountId: string,
+        status: number,
+        retryAfterHeader: string | undefined,
+        errorBody: string
+    ): RateLimitInfo | undefined {
+        // Only handle 429, 500, 503, 529
+        if (status !== 429 && status !== 500 && status !== 503 && status !== 529) {
+            return undefined;
         }
-        return null;
+
+        // 1. Parse reason
+        const reason: RateLimitReason = status === 429
+            ? parseRateLimitReason(errorBody)
+            : 'server_error';
+
+        // 2. Parse retry delay
+        let retryAfterMs: number | undefined;
+
+        // From header
+        if (retryAfterHeader) {
+            const seconds = parseInt(retryAfterHeader, 10);
+            if (!isNaN(seconds)) {
+                retryAfterMs = seconds * 1000;
+            }
+        }
+
+        // From body
+        if (retryAfterMs === undefined) {
+            retryAfterMs = parseRetryDelay(errorBody);
+        }
+
+        // Apply defaults based on reason (with 2s minimum safety buffer)
+        if (retryAfterMs !== undefined && retryAfterMs < 2000) {
+            retryAfterMs = 2000;
+        }
+
+        if (retryAfterMs === undefined) {
+            retryAfterMs = RATE_LIMIT_DEFAULTS[reason];
+        }
+
+        const info: RateLimitInfo = {
+            resetTime: nowMs() + retryAfterMs,
+            retryAfterMs,
+            detectedAt: nowMs(),
+            reason,
+        };
+
+        this.rateLimits.set(accountId, info);
+        this.logger?.warn(
+            `Account ${accountId} [${status}] rate limited: ${reason}, retry after ${retryAfterMs / 1000}s`
+        );
+
+        return info;
+    }
+
+    /**
+     * Clear rate limit for an account
+     */
+    clearRateLimit(accountId: string): boolean {
+        return this.rateLimits.delete(accountId);
+    }
+
+    /**
+     * Clear all rate limits
+     */
+    clearAllRateLimits(): void {
+        const count = this.rateLimits.size;
+        this.rateLimits.clear();
+        this.logger?.info(`Cleared ${count} rate limit record(s)`);
     }
 
     // =========================================================================
     // Session Stickiness (matching Antigravity-Manager)
     // =========================================================================
 
-    /**
-     * Get account bound to a session, if any
-     */
     getAccountForSession(sessionId: string): ManagedAccount | null {
         const index = this.sessionBindings.get(sessionId);
         if (index !== undefined && index < this.accounts.length) {
             const account = this.accounts[index];
-            if (account) {
-                clearExpiredRateLimits(account);
+            if (account && !account.disabled) {
                 return account;
             }
         }
         return null;
     }
 
-    /**
-     * Bind a session to an account
-     */
     bindSession(sessionId: string, accountIndex: number): void {
         this.sessionBindings.set(sessionId, accountIndex);
         this.logger?.debug(`Bound session ${sessionId.slice(0, 8)}... to account ${accountIndex}`);
     }
 
-    /**
-     * Unbind a session (e.g., when account becomes unavailable)
-     */
     unbindSession(sessionId: string): void {
         this.sessionBindings.delete(sessionId);
     }
 
-    /**
-     * Clear all session bindings (e.g., on logout)
-     */
     clearSessionBindings(): void {
         this.sessionBindings.clear();
     }
@@ -484,202 +514,90 @@ export class AccountManager {
     // 60s Global Lock (matching Antigravity-Manager)
     // =========================================================================
 
-    /**
-     * Check if global lock is active and account is still valid
-     */
-    private getGlobalLockedAccount(family: ModelFamily): ManagedAccount | null {
-        if (!this.lastUsedInfo) return null;
-
-        const elapsed = nowMs() - this.lastUsedInfo.timestamp;
-        if (elapsed > GLOBAL_LOCK_DURATION_MS) {
-            // Lock expired
-            return null;
-        }
-
-        // Same family check - only reuse if requesting same family
-        if (this.lastUsedInfo.family !== family) {
-            return null;
-        }
-
-        const account = this.accounts[this.lastUsedInfo.accountIndex];
-        if (!account) return null;
-
-        clearExpiredRateLimits(account);
-        if (!isRateLimitedForFamily(account, family)) {
-            return account;
-        }
-
-        return null;
+    getLastUsedAccount(): { accountIndex: number; timestamp: number } | null {
+        return this.lastUsedAccount;
     }
 
-    /**
-     * Update global lock with recently used account
-     */
-    private updateGlobalLock(accountIndex: number, family: ModelFamily): void {
-        this.lastUsedInfo = {
-            accountIndex,
-            timestamp: nowMs(),
-            family,
-        };
+    updateLastUsedAccount(accountIndex: number): void {
+        this.lastUsedAccount = { accountIndex, timestamp: nowMs() };
+    }
+
+    clearLastUsedAccount(): void {
+        this.lastUsedAccount = null;
     }
 
     // =========================================================================
-    // Account Selection (matching Antigravity-Manager full logic)
+    // Core Account Selection (matching Antigravity-Manager's get_token_internal)
     // =========================================================================
 
     /**
-     * Get account for a request with full Antigravity-Manager logic:
-     * 1. Session stickiness: if session is bound to an account, use it
-     * 2. 60s global lock: for non-image requests, reuse same account within 60s
-     * 3. Tier priority: when selecting new account, prefer ULTRA > PRO > FREE
-     * 4. Rate limit aware: skip rate-limited accounts
+     * Get sorted accounts snapshot by tier priority
+     * Matches Antigravity-Manager's tier sorting
+     */
+    getSortedAccountsSnapshot(): ManagedAccount[] {
+        const snapshot = this.accounts.filter(a => !a.disabled);
+        snapshot.sort((a, b) =>
+            getTierPriority(a.subscriptionTier) - getTierPriority(b.subscriptionTier)
+        );
+        return snapshot;
+    }
+
+    /**
+     * Select next account using round-robin within sorted accounts
+     * Matches Antigravity-Manager's current_index.fetch_add logic
      *
-     * @param family Model family (claude/gemini)
-     * @param sessionId Optional session ID for stickiness
-     * @param isImageRequest Whether this is an image generation request (skips 60s lock)
+     * @param sortedAccounts - Tier-sorted accounts snapshot
+     * @param attempted - Set of already attempted account IDs
+     * @param skipRateLimited - Whether to skip rate-limited accounts
+     * @returns Selected account or null
      */
-    getAccountForRequest(
-        family: ModelFamily,
-        sessionId?: string,
-        isImageRequest: boolean = false
+    selectNextAccount(
+        sortedAccounts: ManagedAccount[],
+        attempted: Set<string>,
+        skipRateLimited: boolean = true
     ): ManagedAccount | null {
-        // 1. Session stickiness: check if session is bound to an account
-        if (sessionId) {
-            const boundAccount = this.getAccountForSession(sessionId);
-            if (boundAccount && !isRateLimitedForFamily(boundAccount, family)) {
-                this.logger?.debug(`Using session-bound account ${boundAccount.index} for session ${sessionId.slice(0, 8)}...`);
-                boundAccount.lastUsed = nowMs();
-                this.updateGlobalLock(boundAccount.index, family);
-                return boundAccount;
-            }
-            // If bound account is rate-limited, unbind and select new
-            if (boundAccount) {
-                this.logger?.info(`Session-bound account ${boundAccount.index} is rate-limited, selecting new account`);
-                this.unbindSession(sessionId);
-            }
-        }
+        const total = sortedAccounts.length;
+        if (total === 0) return null;
 
-        // 2. 60s global lock (skip for image requests - they have separate quotas)
-        if (!isImageRequest) {
-            const lockedAccount = this.getGlobalLockedAccount(family);
-            if (lockedAccount) {
-                this.logger?.debug(`Using global-locked account ${lockedAccount.index} (within 60s window)`);
-                lockedAccount.lastUsed = nowMs();
-                // Bind session to this account if session ID provided
-                if (sessionId) {
-                    this.bindSession(sessionId, lockedAccount.index);
-                }
-                return lockedAccount;
-            }
-        }
+        const startIdx = this.currentIndex % total;
+        this.currentIndex = (this.currentIndex + 1) % total;
 
-        // 3. Select best available account with tier priority
-        const account = this.selectBestAvailableAccount(family);
-        if (account) {
-            account.lastUsed = nowMs();
-            this.updateGlobalLock(account.index, family);
-            this.currentAccountIndexByFamily[family] = account.index;
+        for (let offset = 0; offset < total; offset++) {
+            const idx = (startIdx + offset) % total;
+            const candidate = sortedAccounts[idx];
+            const accountId = candidate.email || String(candidate.index);
 
-            // Bind session to selected account
-            if (sessionId) {
-                this.bindSession(sessionId, account.index);
+            if (attempted.has(accountId)) {
+                continue;
             }
 
-            this.logger?.info(`Selected account ${account.index} (${account.email || 'unknown'}, tier=${account.subscriptionTier || 'UNKNOWN'}) for ${family}`);
+            if (skipRateLimited && this.isRateLimited(accountId)) {
+                continue;
+            }
+
+            return candidate;
         }
 
-        return account;
-    }
-
-    /**
-     * Select best available account based on:
-     * 1. Not rate-limited for the family
-     * 2. Highest tier priority (ULTRA > PRO > FREE)
-     * 3. Least recently used (for load balancing within same tier)
-     */
-    private selectBestAvailableAccount(family: ModelFamily): ManagedAccount | null {
-        // Filter to non-rate-limited accounts
-        const available = this.accounts.filter(a => {
-            clearExpiredRateLimits(a);
-            return !isRateLimitedForFamily(a, family);
-        });
-
-        if (available.length === 0) {
-            return null;
-        }
-
-        // Sort by tier priority (lower = better), then by lastUsed (older = better)
-        const sorted = [...available].sort((a, b) => {
-            const tierDiff = getTierPriority(a.subscriptionTier) - getTierPriority(b.subscriptionTier);
-            if (tierDiff !== 0) return tierDiff;
-            // Same tier: prefer least recently used
-            return a.lastUsed - b.lastUsed;
-        });
-
-        return sorted[0] ?? null;
-    }
-
-    /**
-     * Get current or next available account for a model family.
-     * Automatically rotates to next account if current is rate limited.
-     *
-     * @deprecated Use getAccountForRequest() for full Antigravity-Manager logic
-     */
-    getCurrentOrNextForFamily(family: ModelFamily): ManagedAccount | null {
-        // Delegate to new method without session binding
-        return this.getAccountForRequest(family);
-    }
-
-    /**
-     * Get next available account for a model family
-     */
-    getNextForFamily(family: ModelFamily): ManagedAccount | null {
-        return this.selectBestAvailableAccount(family);
-    }
-
-    /**
-     * Get available header style for an account
-     * Gemini has two quota pools (antigravity vs gemini-cli)
-     */
-    getAvailableHeaderStyle(account: ManagedAccount, family: ModelFamily): HeaderStyle | null {
-        clearExpiredRateLimits(account);
-
-        if (family === 'claude') {
-            return isRateLimitedForQuotaKey(account, 'claude') ? null : 'antigravity';
-        }
-
-        // For Gemini, try antigravity first, then gemini-cli
-        if (!isRateLimitedForQuotaKey(account, 'gemini-antigravity')) {
-            return 'antigravity';
-        }
-        if (!isRateLimitedForQuotaKey(account, 'gemini-cli')) {
-            return 'gemini-cli';
-        }
         return null;
     }
 
     /**
-     * Mark an account as rate limited
-     * @param account The account to mark
-     * @param retryAfterMs The retry delay (if undefined, uses defaults based on reason)
-     * @param family Model family (claude/gemini)
-     * @param headerStyle Header style for Gemini
-     * @param requestType Request type (claude/gemini/image_gen) - used for separate image quota
-     * @param reason Rate limit reason for determining default cooldown
+     * Get minimum wait time across all accounts
+     * Matches Antigravity-Manager's min_wait calculation
      */
-    markRateLimited(
-        account: ManagedAccount,
-        retryAfterMs: number | undefined,
-        family: ModelFamily,
-        headerStyle: HeaderStyle = 'antigravity',
-        requestType?: RequestType,
-        reason: RateLimitReason = 'unknown'
-    ): void {
-        const key = getQuotaKey(family, headerStyle, requestType);
-        // Use provided delay or fall back to reason-based defaults
-        const delay = retryAfterMs ?? RATE_LIMIT_DEFAULTS[reason];
-        account.rateLimitResetTimes[key] = nowMs() + delay;
-        this.logger?.info(`Account ${account.index} (${account.email || 'unknown'}) rate limited for ${key} (${reason}), retry after ${delay}ms`);
+    getMinWaitTime(): number {
+        let minWait = 60; // Default 60s
+
+        for (const account of this.accounts) {
+            if (account.disabled) continue;
+            const accountId = account.email || String(account.index);
+            const seconds = this.getResetSeconds(accountId);
+            if (seconds !== undefined && seconds < minWait) {
+                minWait = seconds;
+            }
+        }
+
+        return minWait;
     }
 
     /**
@@ -688,45 +606,5 @@ export class AccountManager {
     updateAccountTokens(account: ManagedAccount, accessToken: string, expiresAt: number): void {
         account.accessToken = accessToken;
         account.expiresAt = expiresAt;
-    }
-
-    /**
-     * Check if all accounts are rate limited for a family
-     */
-    allAccountsRateLimited(family: ModelFamily): boolean {
-        return this.accounts.every(a => {
-            clearExpiredRateLimits(a);
-            return isRateLimitedForFamily(a, family);
-        });
-    }
-
-    /**
-     * Get minimum wait time until an account becomes available
-     */
-    getMinWaitTime(family: ModelFamily): number {
-        const waitTimes: number[] = [];
-        const now = nowMs();
-
-        for (const account of this.accounts) {
-            if (family === 'claude') {
-                const resetTime = account.rateLimitResetTimes.claude;
-                if (resetTime !== undefined) {
-                    waitTimes.push(Math.max(0, resetTime - now));
-                }
-            } else {
-                // For Gemini, account becomes available when EITHER pool expires
-                const t1 = account.rateLimitResetTimes['gemini-antigravity'];
-                const t2 = account.rateLimitResetTimes['gemini-cli'];
-                const accountWait = Math.min(
-                    t1 !== undefined ? Math.max(0, t1 - now) : Infinity,
-                    t2 !== undefined ? Math.max(0, t2 - now) : Infinity
-                );
-                if (accountWait !== Infinity) {
-                    waitTimes.push(accountWait);
-                }
-            }
-        }
-
-        return waitTimes.length > 0 ? Math.min(...waitTimes) : 0;
     }
 }

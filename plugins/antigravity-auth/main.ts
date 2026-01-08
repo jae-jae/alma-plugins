@@ -17,8 +17,7 @@ import type { PluginContext, PluginActivation } from 'alma-plugin-api';
 import { TokenStore } from './lib/token-store';
 import { getAuthorizationUrl, exchangeCodeForTokens } from './lib/auth';
 import { ANTIGRAVITY_MODELS, getModelFamily, isClaudeThinkingModel, isImageModel, parseImageAspectRatio } from './lib/models';
-import type { ManagedAccount, ModelFamily, HeaderStyle, RequestType } from './lib/account-manager';
-import { parseRateLimitReason, parseRetryDelay } from './lib/account-manager';
+import type { ManagedAccount, ModelFamily, HeaderStyle } from './lib/account-manager';
 import {
     isGenerativeLanguageRequest,
     transformRequest,
@@ -39,9 +38,6 @@ const HTTP_STATUS = {
     TOO_MANY_REQUESTS: 429,
     SERVER_ERROR: 500,
 } as const;
-
-// Default retry-after time in ms (5 minutes)
-const DEFAULT_RETRY_AFTER_MS = 5 * 60 * 1000;
 
 // ============================================================================
 // Session Fingerprint Extraction
@@ -110,20 +106,6 @@ export async function activate(context: PluginContext): Promise<PluginActivation
     // =========================================================================
 
     /**
-     * Parse retry-after header to milliseconds
-     */
-    const parseRetryAfter = (response: Response): number => {
-        const retryAfter = response.headers.get('retry-after');
-        if (retryAfter) {
-            const seconds = parseInt(retryAfter, 10);
-            if (!isNaN(seconds)) {
-                return seconds * 1000;
-            }
-        }
-        return DEFAULT_RETRY_AFTER_MS;
-    };
-
-    /**
      * Determine model family from URL model string
      */
     const getModelFamilyFromUrl = (urlModel: string): ModelFamily => {
@@ -179,6 +161,7 @@ export async function activate(context: PluginContext): Promise<PluginActivation
             let lastError: Error | null = null;
             let lastResponse: Response | null = null;
             let attempts = 0;
+            let forceRotate = false; // Set to true after rate limit to force switching account
             const maxAttempts = tokenStore.getAccountCount() * 2; // Allow 2 attempts per account
 
             while (attempts < maxAttempts) {
@@ -188,13 +171,15 @@ export async function activate(context: PluginContext): Promise<PluginActivation
                 // - Session stickiness (same conversation uses same account)
                 // - 60s global lock (non-image requests reuse account)
                 // - Tier priority (ULTRA > PRO > FREE)
+                // - forceRotate: if previous attempt was rate limited, force switch account
                 let accountInfo: { accessToken: string; projectId: string; account: ManagedAccount; headerStyle: HeaderStyle };
                 try {
-                    accountInfo = await tokenStore.getValidAccessTokenForRequest(modelFamily, sessionId, isImage);
+                    accountInfo = await tokenStore.getValidAccessTokenForRequest(modelFamily, sessionId, isImage, forceRotate);
                 } catch (error) {
                     // All accounts rate limited or no accounts
                     throw error;
                 }
+                forceRotate = false; // Reset after use
 
                 const { accessToken, projectId, account, headerStyle } = accountInfo;
 
@@ -224,51 +209,43 @@ export async function activate(context: PluginContext): Promise<PluginActivation
                             body: transformed.body,
                         });
 
-                        // Handle rate limiting - mark account and retry with next
-                        if (response.status === HTTP_STATUS.TOO_MANY_REQUESTS) {
+                        // Handle rate limiting (429) and server errors (500, 503, 529)
+                        // Mark account and retry with next (matching Antigravity-Manager)
+                        if (response.status === 429 || response.status === 500 || response.status === 503 || response.status === 529) {
                             const errorText = await response.clone().text();
-                            const rateLimitReason = parseRateLimitReason(errorText);
+                            const retryAfterHeader = response.headers.get('retry-after') || undefined;
 
-                            // Try to parse retry delay from error body first, then fall back to header
-                            let retryAfterMs = parseRetryDelay(errorText);
-                            if (retryAfterMs === undefined) {
-                                retryAfterMs = parseRetryAfter(response);
-                            }
+                            logger.warn(`Error ${response.status} at ${endpoint}, account ${account.index} (${account.email || 'unknown'})`);
 
-                            // Determine request type for quota tracking
-                            const requestType: RequestType = isImage ? 'image_gen' : (modelFamily === 'claude' ? 'claude' : 'gemini');
+                            // Mark account as rate limited (matching Antigravity-Manager's parse_from_error)
+                            await tokenStore.markRateLimited(account, response.status, retryAfterHeader, errorText);
 
-                            logger.warn(`Rate limited at ${endpoint}, account ${account.index}, reason=${rateLimitReason}, requestType=${requestType}, retry after ${retryAfterMs}ms`);
-
-                            // Mark this account as rate limited for this family/headerStyle/requestType
-                            // For QUOTA_EXHAUSTED, use default (1 hour), for others use parsed or header value
-                            await tokenStore.markRateLimited(
-                                account,
-                                rateLimitReason === 'quota_exhausted' ? undefined : retryAfterMs,
-                                modelFamily,
-                                headerStyle,
-                                requestType,
-                                rateLimitReason
+                            // Check if we have more available accounts
+                            const accountId = account.email || String(account.index);
+                            const accountManager = tokenStore.getAccountManager();
+                            const hasAvailableAccounts = accountManager.getSortedAccountsSnapshot().some(
+                                a => (a.email || String(a.index)) !== accountId && !accountManager.isRateLimited(a.email || String(a.index))
                             );
 
-                            // If we have more accounts, try next one
-                            if (!tokenStore.getAccountManager().allAccountsRateLimited(modelFamily)) {
+                            if (hasAvailableAccounts) {
                                 logger.info('Switching to next available account...');
+                                forceRotate = true; // Force switch account on next iteration
                                 break; // Break from endpoint loop to try next account
                             }
 
                             // All accounts rate limited, return error
+                            const minWait = accountManager.getMinWaitTime();
                             const headers = new Headers(response.headers);
-                            headers.set('retry-after', String(Math.ceil(retryAfterMs / 1000)));
+                            headers.set('retry-after', String(minWait));
                             return new Response(response.body, {
-                                status: HTTP_STATUS.TOO_MANY_REQUESTS,
-                                statusText: 'Too Many Requests',
+                                status: response.status,
+                                statusText: response.statusText,
                                 headers,
                             });
                         }
 
-                        // Handle server errors - try next endpoint
-                        if (response.status >= HTTP_STATUS.SERVER_ERROR) {
+                        // Handle other server errors (not 500, 503, 529 which are handled above) - try next endpoint
+                        if (response.status >= HTTP_STATUS.SERVER_ERROR && response.status !== 500 && response.status !== 503 && response.status !== 529) {
                             const errorText = await response.clone().text();
                             logger.warn(`Server error at ${endpoint}: ${response.status}`, errorText);
                             lastResponse = response;
@@ -586,19 +563,10 @@ export async function activate(context: PluginContext): Promise<PluginActivation
         title: 'Clear Rate Limits',
         description: 'Clear all rate limit states from Antigravity accounts',
         handler: async () => {
-            const accountManager = tokenStore.getAccountManager();
-            const accounts = accountManager.getAccounts();
-            let clearedCount = 0;
-            for (const account of accounts) {
-                const keys = Object.keys(account.rateLimitResetTimes);
-                clearedCount += keys.length;
-                for (const key of keys) {
-                    delete account.rateLimitResetTimes[key as keyof typeof account.rateLimitResetTimes];
-                }
-            }
-            await tokenStore.saveAccounts();
-            logger.info(`Cleared ${clearedCount} rate limit(s) from ${accounts.length} account(s)`);
-            ui.showNotification(`Cleared ${clearedCount} rate limit(s) from ${accounts.length} account(s)`, { type: 'success' });
+            await tokenStore.clearAllRateLimits();
+            const accountCount = tokenStore.getAccountCount();
+            logger.info(`Cleared all rate limits from ${accountCount} account(s)`);
+            ui.showNotification(`Cleared all rate limits from ${accountCount} account(s)`, { type: 'success' });
         },
     });
 
