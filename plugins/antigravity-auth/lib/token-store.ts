@@ -325,6 +325,11 @@ export class TokenStore {
             this.logger.info(`Fetching quota for account ${account.index} (${account.email || 'unknown'})...`);
             const quota = await fetchQuota(account.accessToken, account.projectId);
             account.quota = quota;
+            // Update subscription tier for rotation priority (ULTRA > PRO > FREE)
+            if (quota.subscriptionTier) {
+                account.subscriptionTier = quota.subscriptionTier;
+                this.logger.info(`Account ${account.index} subscription tier: ${quota.subscriptionTier}`);
+            }
             this.logger.info(`Got ${quota.models.length} model(s) for account ${account.index}`);
             return quota;
         } catch (error) {

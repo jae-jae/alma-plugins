@@ -3,7 +3,9 @@
  * This mirrors the implementation in Antigravity-Manager.
  */
 
-const QUOTA_API_URL = 'https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels';
+const CLOUD_CODE_BASE_URL = 'https://cloudcode-pa.googleapis.com';
+const QUOTA_API_URL = `${CLOUD_CODE_BASE_URL}/v1internal:fetchAvailableModels`;
+const LOAD_CODE_ASSIST_URL = `${CLOUD_CODE_BASE_URL}/v1internal:loadCodeAssist`;
 
 interface QuotaInfo {
     remainingFraction?: number;
@@ -18,6 +20,21 @@ interface QuotaResponse {
     models: Record<string, ModelInfo>;
 }
 
+interface Tier {
+    id?: string;
+    quotaTier?: string;
+    name?: string;
+    slug?: string;
+}
+
+interface LoadProjectResponse {
+    cloudaicompanionProject?: string;
+    currentTier?: Tier;
+    paidTier?: Tier;
+}
+
+export type SubscriptionTier = 'ULTRA' | 'PRO' | 'FREE' | 'UNKNOWN';
+
 export interface ModelQuota {
     name: string;
     percentage: number;
@@ -27,31 +44,73 @@ export interface ModelQuota {
 export interface QuotaData {
     models: ModelQuota[];
     lastUpdated: number;
+    subscriptionTier?: SubscriptionTier;
+}
+
+/**
+ * Fetch subscription tier from loadCodeAssist API.
+ * This is used for account rotation priority (ULTRA > PRO > FREE).
+ * @param accessToken - Valid OAuth access token
+ * @returns Subscription tier or undefined
+ */
+async function fetchSubscriptionTier(accessToken: string): Promise<SubscriptionTier | undefined> {
+    try {
+        const response = await fetch(LOAD_CODE_ASSIST_URL, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${accessToken}`,
+                'Content-Type': 'application/json',
+                'User-Agent': 'antigravity/windows/amd64',
+            },
+            body: JSON.stringify({ metadata: { ideType: 'ANTIGRAVITY' } }),
+        });
+
+        if (!response.ok) {
+            return undefined;
+        }
+
+        const data: LoadProjectResponse = await response.json();
+
+        // Priority: paidTier > currentTier (matches Antigravity-Manager logic)
+        const tierId = data.paidTier?.id ?? data.currentTier?.id;
+
+        if (tierId === 'ULTRA' || tierId === 'PRO' || tierId === 'FREE') {
+            return tierId as SubscriptionTier;
+        }
+
+        return 'UNKNOWN';
+    } catch {
+        return undefined;
+    }
 }
 
 /**
  * Fetch quota data from the Google Cloud Code API.
  * @param accessToken - Valid OAuth access token
  * @param projectId - Antigravity project ID
- * @returns QuotaData with model quotas
+ * @returns QuotaData with model quotas and subscription tier
  */
 export async function fetchQuota(accessToken: string, projectId: string): Promise<QuotaData> {
-    const response = await fetch(QUOTA_API_URL, {
-        method: 'POST',
-        headers: {
-            'Authorization': `Bearer ${accessToken}`,
-            'Content-Type': 'application/json',
-            'User-Agent': 'antigravity/1.11.3 Darwin/arm64',
-        },
-        body: JSON.stringify({ project: projectId }),
-    });
+    // Fetch subscription tier and quota in parallel
+    const [subscriptionTier, quotaResponse] = await Promise.all([
+        fetchSubscriptionTier(accessToken),
+        fetch(QUOTA_API_URL, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${accessToken}`,
+                'Content-Type': 'application/json',
+                'User-Agent': 'antigravity/1.11.3 Darwin/arm64',
+            },
+            body: JSON.stringify({ project: projectId }),
+        }),
+    ]);
 
-    if (!response.ok) {
-        const errorText = await response.text().catch(() => '');
-        throw new Error(`Quota API error: ${response.status} - ${errorText}`);
+    if (!quotaResponse.ok) {
+        const errorText = await quotaResponse.text().catch(() => '');
+        throw new Error(`Quota API error: ${quotaResponse.status} - ${errorText}`);
     }
 
-    const data: QuotaResponse = await response.json();
+    const data: QuotaResponse = await quotaResponse.json();
     const models: ModelQuota[] = [];
 
     for (const [name, info] of Object.entries(data.models)) {
@@ -70,5 +129,6 @@ export async function fetchQuota(accessToken: string, projectId: string): Promis
     return {
         models,
         lastUpdated: Date.now(),
+        subscriptionTier,
     };
 }
