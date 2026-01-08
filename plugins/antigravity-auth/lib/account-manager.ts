@@ -282,6 +282,22 @@ export class AccountManager {
             subscriptionTier: acc.subscriptionTier,
         }));
 
+        // Auto-clear expired rate limits on load
+        const now = nowMs();
+        let clearedCount = 0;
+        for (const account of this.accounts) {
+            for (const key of Object.keys(account.rateLimitResetTimes) as QuotaKey[]) {
+                const resetTime = account.rateLimitResetTimes[key];
+                if (resetTime !== undefined && now >= resetTime) {
+                    delete account.rateLimitResetTimes[key];
+                    clearedCount++;
+                }
+            }
+        }
+        if (clearedCount > 0) {
+            this.logger?.info(`Cleared ${clearedCount} expired rate limit(s) on load`);
+        }
+
         this.currentAccountIndexByFamily.claude = Math.max(0, data.activeIndexByFamily?.claude ?? 0) % Math.max(1, this.accounts.length);
         this.currentAccountIndexByFamily.gemini = Math.max(0, data.activeIndexByFamily?.gemini ?? 0) % Math.max(1, this.accounts.length);
         this.cursor = this.currentAccountIndexByFamily.claude;

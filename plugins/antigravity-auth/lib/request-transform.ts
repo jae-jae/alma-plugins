@@ -346,6 +346,7 @@ You are pair programming with a USER to solve their coding task. The task may re
             for (const part of geminiRequest.systemInstruction.parts) {
                 if (part.text && part.text.includes('You are Antigravity')) {
                     userHasAntigravity = true;
+                    logger?.debug(`[Identity] User already has Antigravity identity in systemInstruction`);
                     break;
                 }
             }
@@ -356,13 +357,17 @@ You are pair programming with a USER to solve their coding task. The task may re
             if (geminiRequest.systemInstruction?.parts) {
                 // 在前面插入 Antigravity 身份
                 geminiRequest.systemInstruction.parts.unshift({ text: antigravityIdentity });
+                logger?.debug(`[Identity] Injected Antigravity identity at beginning of existing systemInstruction`);
             } else {
                 // 没有 systemInstruction,创建一个新的
                 geminiRequest.systemInstruction = {
                     parts: [{ text: antigravityIdentity }],
                 };
+                logger?.debug(`[Identity] Created new systemInstruction with Antigravity identity`);
             }
         }
+    } else {
+        logger?.debug(`[Identity] Skipping identity injection for image model: ${requestedModel}`);
     }
 
     // Add image generation config for Gemini image models
