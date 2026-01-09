@@ -51,7 +51,6 @@ const MODEL_MAPPING: Record<string, string> = {
     'gemini-3-pro-low': 'gemini-3-pro-low',
     'gemini-3-pro-high': 'gemini-3-pro-high',
     'gemini-3-pro-preview': 'gemini-3-pro-preview',
-    'gemini-3-pro': 'gemini-3-pro',
     'gemini-2.5-flash': 'gemini-2.5-flash',
     'gemini-3-flash': 'gemini-3-flash',
     'gemini-3-pro-image': 'gemini-3-pro-image',
@@ -470,14 +469,6 @@ export const ANTIGRAVITY_MODELS: AntigravityModelInfo[] = [
     // -------------------------------------------------------------------------
     // Gemini 3.0 Models
     // -------------------------------------------------------------------------
-    {
-        id: 'gemini-3-pro',
-        name: 'Gemini 3 Pro',
-        baseModel: 'gemini-3-pro',
-        family: 'gemini',
-        contextWindow: 1048576,
-        maxOutputTokens: 65536,
-    },
     {
         id: 'gemini-3-pro-low',
         name: 'Gemini 3 Pro Low',
