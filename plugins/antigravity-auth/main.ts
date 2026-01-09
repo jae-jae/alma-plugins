@@ -215,10 +215,11 @@ export async function activate(context: PluginContext): Promise<PluginActivation
                             const errorText = await response.clone().text();
                             const retryAfterHeader = response.headers.get('retry-after') || undefined;
 
-                            logger.warn(`Error ${response.status} at ${endpoint}, account ${account.index} (${account.email || 'unknown'})`);
+                            logger.warn(`Error ${response.status} at ${endpoint}, account ${account.index} (${account.email || 'unknown'}), model ${transformed.effectiveModel}`);
 
-                            // Mark account as rate limited (matching Antigravity-Manager's parse_from_error)
-                            await tokenStore.markRateLimited(account, response.status, retryAfterHeader, errorText);
+                            // Mark account as rate limited (matching Antigravity-Manager's mark_rate_limited_async)
+                            // Pass the model to enable model-level rate limiting tracking
+                            await tokenStore.markRateLimited(account, response.status, retryAfterHeader, errorText, transformed.effectiveModel);
 
                             // Check if we have more available accounts
                             const accountId = account.email || String(account.index);

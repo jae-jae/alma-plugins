@@ -418,15 +418,17 @@ export class TokenStore {
      * @param status HTTP status code (429, 500, 503, 529)
      * @param retryAfterHeader Retry-After header value
      * @param errorBody Error response body
+     * @param model Optional model name for model-level rate limiting tracking
      */
     async markRateLimited(
         account: ManagedAccount,
         status: number,
         retryAfterHeader: string | undefined,
-        errorBody: string
+        errorBody: string,
+        model?: string
     ): Promise<void> {
         const accountId = account.email || String(account.index);
-        this.accountManager.markRateLimited(accountId, status, retryAfterHeader, errorBody);
+        this.accountManager.markRateLimited(accountId, status, retryAfterHeader, errorBody, model);
         await this.saveAccounts();
     }
 

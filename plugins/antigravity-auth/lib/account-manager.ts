@@ -55,6 +55,9 @@ export interface RateLimitInfo {
     retryAfterMs: number;
     detectedAt: number;
     reason: RateLimitReason;
+    /** Associated model (for model-level rate limiting)
+     * undefined = account-level rate limit, string = specific model rate limit */
+    model?: string;
 }
 
 export interface ManagedAccount {
@@ -449,13 +452,16 @@ export class AccountManager {
 
     /**
      * Mark account as rate limited
-     * Matches Antigravity-Manager's parse_from_error
+     * Matches Antigravity-Manager's parse_from_error / mark_rate_limited_async
+     *
+     * @param model Optional model name for model-level rate limiting tracking
      */
     markRateLimited(
         accountId: string,
         status: number,
         retryAfterHeader: string | undefined,
-        errorBody: string
+        errorBody: string,
+        model?: string
     ): RateLimitInfo | undefined {
         // Only handle 429, 500, 503, 529
         if (status !== 429 && status !== 500 && status !== 503 && status !== 529) {
@@ -497,12 +503,21 @@ export class AccountManager {
             retryAfterMs,
             detectedAt: nowMs(),
             reason,
+            model,  // Track which model caused the rate limit
         };
 
         this.rateLimits.set(accountId, info);
-        this.logger?.warn(
-            `Account ${accountId} [${status}] rate limited: ${reason}, retry after ${retryAfterMs / 1000}s`
-        );
+
+        // Enhanced logging with model info (matches Antigravity-Manager v3.3.19)
+        if (model) {
+            this.logger?.warn(
+                `Account ${accountId} model ${model} [${status}] rate limited: ${reason}, retry after ${retryAfterMs / 1000}s`
+            );
+        } else {
+            this.logger?.warn(
+                `Account ${accountId} [${status}] rate limited: ${reason}, retry after ${retryAfterMs / 1000}s`
+            );
+        }
 
         return info;
     }
