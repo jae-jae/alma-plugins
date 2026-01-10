@@ -412,7 +412,12 @@ export class TokenStore {
 
     /**
      * Mark an account as rate limited.
-     * Matches Antigravity-Manager's mark_rate_limited.
+     * Matches Antigravity-Manager's mark_rate_limited_async with realtime quota fallback.
+     *
+     * Strategy (matching Antigravity-Manager):
+     * 1. If API returns explicit time (quotaResetDelay, retry-after) → use directly
+     * 2. If not → fetch realtime quota to get accurate reset time
+     * 3. Fallback to default rate limit handling
      *
      * @param account The account to mark
      * @param status HTTP status code (429, 500, 503, 529)
@@ -428,8 +433,87 @@ export class TokenStore {
         model?: string
     ): Promise<void> {
         const accountId = account.email || String(account.index);
-        this.accountManager.markRateLimited(accountId, status, retryAfterHeader, errorBody, model);
+
+        // Check if API returned explicit retry time
+        const hasExplicitRetryTime = retryAfterHeader ||
+            errorBody.includes('quotaResetDelay') ||
+            errorBody.includes('retry after') ||
+            errorBody.includes('try again in');
+
+        if (hasExplicitRetryTime) {
+            // API returned explicit time, use it directly
+            this.logger.debug(`Account ${accountId} 429 response has explicit retry time, using API-provided time`);
+            this.accountManager.markRateLimited(accountId, status, retryAfterHeader, errorBody, model);
+        } else {
+            // No explicit time - try to fetch real quota to get accurate reset time
+            this.logger.info(`Account ${accountId} 429 response has no explicit retry time, fetching real quota...`);
+            const locked = await this.fetchAndLockWithRealtimeQuota(account, model);
+
+            if (!locked) {
+                // Fallback to default rate limit handling
+                this.logger.warn(`Failed to fetch realtime quota for ${accountId}, using default rate limit`);
+                this.accountManager.markRateLimited(accountId, status, retryAfterHeader, errorBody, model);
+            }
+        }
+
         await this.saveAccounts();
+    }
+
+    /**
+     * Fetch realtime quota and lock account with accurate reset time.
+     * Matches Antigravity-Manager's fetch_and_lock_with_realtime_quota.
+     *
+     * @param account Account to lock
+     * @param model Optional model for model-level rate limiting
+     * @returns true if successfully locked with real quota data
+     */
+    private async fetchAndLockWithRealtimeQuota(
+        account: ManagedAccount,
+        model?: string
+    ): Promise<boolean> {
+        const accountId = account.email || String(account.index);
+
+        try {
+            // Refresh token if needed
+            if (!account.accessToken || !account.expiresAt || isTokenExpired(account.expiresAt)) {
+                await this.refreshAccountTokenInternal(account);
+            }
+
+            if (!account.accessToken) {
+                this.logger.warn(`No access token for account ${accountId}, cannot fetch realtime quota`);
+                return false;
+            }
+
+            // Fetch fresh quota
+            this.logger.info(`Fetching realtime quota for account ${accountId}...`);
+            const quota = await fetchQuota(account.accessToken, account.projectId);
+            account.quota = quota;
+
+            // Find earliest reset time from quota data
+            const earliestReset = quota.models
+                .filter(m => m.resetTime)
+                .map(m => m.resetTime)
+                .filter(t => t)
+                .sort()[0];
+
+            if (earliestReset) {
+                this.logger.info(`Account ${accountId} realtime quota fetched, reset_time: ${earliestReset}`);
+
+                // Parse the ISO timestamp and set rate limit
+                const resetTimeMs = new Date(earliestReset).getTime();
+                if (!isNaN(resetTimeMs) && resetTimeMs > Date.now()) {
+                    const retryAfterMs = resetTimeMs - Date.now();
+                    this.accountManager.setRateLimitWithResetTime(accountId, resetTimeMs, retryAfterMs, 'quota_exceeded', model);
+                    return true;
+                }
+            }
+
+            this.logger.warn(`Account ${accountId} quota fetched but no valid reset_time found`);
+            return false;
+        } catch (error) {
+            this.logger.warn(`Failed to fetch realtime quota for ${accountId}:`, error);
+            return false;
+        }
     }
 
     /**
@@ -465,7 +549,7 @@ export class TokenStore {
 
     /**
      * Get all accounts info for display
-     * Auto-cleans expired rate limits before returning
+     * Uses quota data for accurate rate limit status
      */
     getAccountsInfo(): Array<{
         index: number;
@@ -476,14 +560,37 @@ export class TokenStore {
         quota?: QuotaData;
         subscriptionTier?: string;
     }> {
-        // Cleanup expired rate limits before returning account info
-        this.accountManager.cleanupExpiredRateLimits();
+        // Cleanup rate limits using quota data
+        this.accountManager.cleanupRateLimitsWithQuota();
 
         return this.accountManager.getAccounts().map(a => {
             const accountId = a.email || String(a.index);
-            const resetSeconds = this.accountManager.getResetSeconds(accountId);
-            const isRateLimited = resetSeconds !== undefined && resetSeconds > 0;
-            const rateLimitResetAt = isRateLimited ? Date.now() + resetSeconds * 1000 : undefined;
+
+            // Use quota-based availability check for accurate status
+            const isAvailable = this.accountManager.isAccountAvailable(a);
+            const isRateLimited = !isAvailable;
+
+            // Get reset time from quota data or timer
+            let rateLimitResetAt: number | undefined;
+            if (isRateLimited) {
+                // Try to get reset time from quota data first
+                if (a.quota?.models && a.quota.models.length > 0) {
+                    const earliestReset = a.quota.models
+                        .filter(m => m.resetTime)
+                        .map(m => new Date(m.resetTime).getTime())
+                        .filter(t => !isNaN(t) && t > Date.now())
+                        .sort((a, b) => a - b)[0];
+                    rateLimitResetAt = earliestReset;
+                }
+
+                // Fall back to timer-based reset time
+                if (!rateLimitResetAt) {
+                    const resetSeconds = this.accountManager.getResetSeconds(accountId);
+                    if (resetSeconds) {
+                        rateLimitResetAt = Date.now() + resetSeconds * 1000;
+                    }
+                }
+            }
 
             return {
                 index: a.index,
@@ -498,11 +605,17 @@ export class TokenStore {
     }
 
     /**
-     * Cleanup all expired rate limits
-     * @returns Number of expired rate limits cleared
+     * Refresh quota and clear rate limits for accounts that have recovered
+     * This is the proper way to clear rate limits - using real quota data
+     *
+     * @returns Number of rate limits cleared
      */
-    cleanupExpiredRateLimits(): number {
-        return this.accountManager.cleanupExpiredRateLimits();
+    async refreshAndClearRateLimits(): Promise<number> {
+        this.logger.info('Refreshing quotas to check for recovered accounts...');
+        await this.refreshAllQuotas();
+        const cleared = this.accountManager.cleanupRateLimitsWithQuota();
+        this.logger.info(`Cleared ${cleared} rate limit(s) based on refreshed quota data`);
+        return cleared;
     }
 
     /**

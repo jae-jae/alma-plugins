@@ -419,76 +419,113 @@ export class AccountManager {
     // =========================================================================
 
     /**
-     * Check if account is rate limited
+     * Check if account is rate limited based on timer
      * Matches Antigravity-Manager's is_rate_limited
-     * Auto-cleans expired rate limits for better UX
+     *
+     * Note: This checks the local rate limit timer. For accurate status,
+     * use isAccountAvailable() which checks real quota data.
      */
     isRateLimited(accountId: string): boolean {
         const info = this.rateLimits.get(accountId);
         if (!info) return false;
+        return info.resetTime > nowMs();
+    }
 
-        // Auto-cleanup: if rate limit has expired, remove it and return false
-        if (info.resetTime <= nowMs()) {
-            this.rateLimits.delete(accountId);
-            this.logger?.debug(`Auto-cleared expired rate limit for account ${accountId}`);
-            return false;
+    /**
+     * Check if account is available based on real quota data
+     * This is more accurate than isRateLimited() which uses timers
+     *
+     * @param account Account to check
+     * @param model Optional model to check specific model quota
+     * @returns true if account has remaining quota
+     */
+    isAccountAvailable(account: ManagedAccount, model?: string): boolean {
+        // If no quota data, fall back to timer-based check
+        if (!account.quota?.models || account.quota.models.length === 0) {
+            const accountId = account.email || String(account.index);
+            return !this.isRateLimited(accountId);
         }
 
-        return true;
+        // Check quota data - if any relevant model has > 0% remaining, account is available
+        const modelsToCheck = model
+            ? account.quota.models.filter(m => m.name.includes(model) || model.includes(m.name))
+            : account.quota.models;
+
+        // If no matching model found, check all models
+        const targetModels = modelsToCheck.length > 0 ? modelsToCheck : account.quota.models;
+
+        // Account is available if ANY model has remaining quota
+        return targetModels.some(m => m.percentage > 0);
+    }
+
+    /**
+     * Clear rate limit for an account if quota data shows it's recovered
+     * This uses real quota data instead of just timers
+     *
+     * @param account Account to check
+     * @returns true if rate limit was cleared, false if still limited or no rate limit existed
+     */
+    clearRateLimitIfRecovered(account: ManagedAccount): boolean {
+        const accountId = account.email || String(account.index);
+        const info = this.rateLimits.get(accountId);
+        if (!info) return false;
+
+        // Check if quota data shows recovery
+        if (this.isAccountAvailable(account)) {
+            this.rateLimits.delete(accountId);
+            this.logger?.info(`Cleared rate limit for ${accountId} based on quota data (recovered)`);
+            return true;
+        }
+
+        // Also clear if timer has expired (fallback)
+        if (info.resetTime <= nowMs()) {
+            this.rateLimits.delete(accountId);
+            this.logger?.debug(`Cleared expired rate limit for ${accountId}`);
+            return true;
+        }
+
+        return false;
     }
 
     /**
      * Get remaining wait time in seconds
      * Matches Antigravity-Manager's get_remaining_wait
-     * Auto-cleans expired rate limits
      */
     getRemainingWait(accountId: string): number {
         const info = this.rateLimits.get(accountId);
         if (!info) return 0;
         const remaining = info.resetTime - nowMs();
-        if (remaining <= 0) {
-            // Auto-cleanup expired rate limit
-            this.rateLimits.delete(accountId);
-            return 0;
-        }
-        return Math.ceil(remaining / 1000);
+        return remaining > 0 ? Math.ceil(remaining / 1000) : 0;
     }
 
     /**
      * Get reset time in seconds for an account
      * Matches Antigravity-Manager's get_reset_seconds
-     * Auto-cleans expired rate limits
      */
     getResetSeconds(accountId: string): number | undefined {
         const info = this.rateLimits.get(accountId);
         if (!info) return undefined;
         const remaining = info.resetTime - nowMs();
-        if (remaining <= 0) {
-            // Auto-cleanup expired rate limit
-            this.rateLimits.delete(accountId);
-            return undefined;
-        }
-        return Math.ceil(remaining / 1000);
+        return remaining > 0 ? Math.ceil(remaining / 1000) : undefined;
     }
 
     /**
-     * Cleanup all expired rate limits
-     * Matches Antigravity-Manager's cleanup_expired
-     * @returns Number of expired rate limits cleared
+     * Cleanup rate limits using quota data from accounts
+     * This uses real quota data to determine if accounts have recovered
+     *
+     * @returns Number of rate limits cleared
      */
-    cleanupExpiredRateLimits(): number {
-        const now = nowMs();
+    cleanupRateLimitsWithQuota(): number {
         let count = 0;
 
-        for (const [accountId, info] of this.rateLimits.entries()) {
-            if (info.resetTime <= now) {
-                this.rateLimits.delete(accountId);
+        for (const account of this.accounts) {
+            if (this.clearRateLimitIfRecovered(account)) {
                 count++;
             }
         }
 
         if (count > 0) {
-            this.logger?.debug(`Cleaned up ${count} expired rate limit record(s)`);
+            this.logger?.info(`Cleared ${count} rate limit(s) based on quota data`);
         }
 
         return count;
@@ -560,6 +597,46 @@ export class AccountManager {
         } else {
             this.logger?.warn(
                 `Account ${accountId} [${status}] rate limited: ${reason}, retry after ${retryAfterMs / 1000}s`
+            );
+        }
+
+        return info;
+    }
+
+    /**
+     * Set rate limit with explicit reset time from quota API
+     * Used when we have accurate reset time from realtime quota fetch
+     *
+     * @param accountId Account ID
+     * @param resetTimeMs Absolute reset time in milliseconds
+     * @param retryAfterMs Delay in milliseconds
+     * @param reason Rate limit reason
+     * @param model Optional model name
+     */
+    setRateLimitWithResetTime(
+        accountId: string,
+        resetTimeMs: number,
+        retryAfterMs: number,
+        reason: RateLimitReason,
+        model?: string
+    ): RateLimitInfo {
+        const info: RateLimitInfo = {
+            resetTime: resetTimeMs,
+            retryAfterMs,
+            detectedAt: nowMs(),
+            reason,
+            model,
+        };
+
+        this.rateLimits.set(accountId, info);
+
+        if (model) {
+            this.logger?.warn(
+                `Account ${accountId} model ${model} rate limited (quota API): ${reason}, reset at ${new Date(resetTimeMs).toISOString()}`
+            );
+        } else {
+            this.logger?.warn(
+                `Account ${accountId} rate limited (quota API): ${reason}, reset at ${new Date(resetTimeMs).toISOString()}`
             );
         }
 

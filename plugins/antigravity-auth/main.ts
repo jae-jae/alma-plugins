@@ -562,12 +562,18 @@ export async function activate(context: PluginContext): Promise<PluginActivation
 
     const clearRateLimitsCommand = commands.register('clear-rate-limits', {
         title: 'Clear Rate Limits',
-        description: 'Clear all rate limit states from Antigravity accounts',
+        description: 'Refresh quotas and clear rate limits for recovered accounts',
         handler: async () => {
-            await tokenStore.clearAllRateLimits();
+            ui.showNotification('Refreshing quotas to check for recovered accounts...', { type: 'info' });
+            const clearedCount = await tokenStore.refreshAndClearRateLimits();
             const accountCount = tokenStore.getAccountCount();
-            logger.info(`Cleared all rate limits from ${accountCount} account(s)`);
-            ui.showNotification(`Cleared all rate limits from ${accountCount} account(s)`, { type: 'success' });
+            if (clearedCount > 0) {
+                logger.info(`Cleared ${clearedCount} rate limit(s) from ${accountCount} account(s) based on quota data`);
+                ui.showNotification(`Cleared ${clearedCount} rate limit(s) based on quota data`, { type: 'success' });
+            } else {
+                logger.info('No rate limits to clear (accounts still limited or no rate limits active)');
+                ui.showNotification('No rate limits to clear (accounts still limited)', { type: 'info' });
+            }
         },
     });
 
