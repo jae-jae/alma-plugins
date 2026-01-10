@@ -421,33 +421,77 @@ export class AccountManager {
     /**
      * Check if account is rate limited
      * Matches Antigravity-Manager's is_rate_limited
+     * Auto-cleans expired rate limits for better UX
      */
     isRateLimited(accountId: string): boolean {
         const info = this.rateLimits.get(accountId);
         if (!info) return false;
-        return info.resetTime > nowMs();
+
+        // Auto-cleanup: if rate limit has expired, remove it and return false
+        if (info.resetTime <= nowMs()) {
+            this.rateLimits.delete(accountId);
+            this.logger?.debug(`Auto-cleared expired rate limit for account ${accountId}`);
+            return false;
+        }
+
+        return true;
     }
 
     /**
      * Get remaining wait time in seconds
      * Matches Antigravity-Manager's get_remaining_wait
+     * Auto-cleans expired rate limits
      */
     getRemainingWait(accountId: string): number {
         const info = this.rateLimits.get(accountId);
         if (!info) return 0;
         const remaining = info.resetTime - nowMs();
-        return remaining > 0 ? Math.ceil(remaining / 1000) : 0;
+        if (remaining <= 0) {
+            // Auto-cleanup expired rate limit
+            this.rateLimits.delete(accountId);
+            return 0;
+        }
+        return Math.ceil(remaining / 1000);
     }
 
     /**
      * Get reset time in seconds for an account
      * Matches Antigravity-Manager's get_reset_seconds
+     * Auto-cleans expired rate limits
      */
     getResetSeconds(accountId: string): number | undefined {
         const info = this.rateLimits.get(accountId);
         if (!info) return undefined;
         const remaining = info.resetTime - nowMs();
-        return remaining > 0 ? Math.ceil(remaining / 1000) : undefined;
+        if (remaining <= 0) {
+            // Auto-cleanup expired rate limit
+            this.rateLimits.delete(accountId);
+            return undefined;
+        }
+        return Math.ceil(remaining / 1000);
+    }
+
+    /**
+     * Cleanup all expired rate limits
+     * Matches Antigravity-Manager's cleanup_expired
+     * @returns Number of expired rate limits cleared
+     */
+    cleanupExpiredRateLimits(): number {
+        const now = nowMs();
+        let count = 0;
+
+        for (const [accountId, info] of this.rateLimits.entries()) {
+            if (info.resetTime <= now) {
+                this.rateLimits.delete(accountId);
+                count++;
+            }
+        }
+
+        if (count > 0) {
+            this.logger?.debug(`Cleaned up ${count} expired rate limit record(s)`);
+        }
+
+        return count;
     }
 
     /**

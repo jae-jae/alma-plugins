@@ -465,6 +465,7 @@ export class TokenStore {
 
     /**
      * Get all accounts info for display
+     * Auto-cleans expired rate limits before returning
      */
     getAccountsInfo(): Array<{
         index: number;
@@ -475,6 +476,9 @@ export class TokenStore {
         quota?: QuotaData;
         subscriptionTier?: string;
     }> {
+        // Cleanup expired rate limits before returning account info
+        this.accountManager.cleanupExpiredRateLimits();
+
         return this.accountManager.getAccounts().map(a => {
             const accountId = a.email || String(a.index);
             const resetSeconds = this.accountManager.getResetSeconds(accountId);
@@ -491,6 +495,14 @@ export class TokenStore {
                 subscriptionTier: a.subscriptionTier,
             };
         });
+    }
+
+    /**
+     * Cleanup all expired rate limits
+     * @returns Number of expired rate limits cleared
+     */
+    cleanupExpiredRateLimits(): number {
+        return this.accountManager.cleanupExpiredRateLimits();
     }
 
     /**
