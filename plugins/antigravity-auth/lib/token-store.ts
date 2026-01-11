@@ -626,7 +626,6 @@ export class TokenStore {
         try {
             // Ensure we have a valid access token
             if (!account.accessToken || !account.expiresAt || isTokenExpired(account.expiresAt)) {
-                this.logger.info(`Refreshing token for account ${account.index} (${account.email || 'unknown'})...`);
                 await this.refreshAccountTokenInternal(account);
                 await this.saveAccounts();
             }
