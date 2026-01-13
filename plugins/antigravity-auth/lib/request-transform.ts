@@ -127,19 +127,16 @@ function restoreThinkingSignatures(contents: GeminiContent[], sessionId: string)
             // (Claude will reject it without a signature)
         }
 
-        // If all parts were filtered out, keep at least one empty text part
+        // If all parts were filtered out, mark this content for removal
         if (processedParts.length === 0) {
-            return {
-                ...content,
-                parts: [{ text: '' }],
-            };
+            return null;
         }
 
         return {
             ...content,
             parts: processedParts,
         };
-    });
+    }).filter((content): content is GeminiContent => content !== null);
 }
 
 /**

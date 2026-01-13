@@ -140,17 +140,13 @@ function stripAllThinkingBlocks(contents: GeminiContent[]): GeminiContent[] {
 
         const filteredParts = content.parts.filter(part => !isThinkingPart(part));
 
-        // If all parts were filtered out, keep at least one empty text part
-        // (same as restoreThinkingSignatures does)
+        // If all parts were filtered out, mark this content for removal
         if (filteredParts.length === 0) {
-            return {
-                ...content,
-                parts: [{ text: '' }],
-            };
+            return null;
         }
 
         return { ...content, parts: filteredParts };
-    });
+    }).filter((content): content is GeminiContent => content !== null);
 }
 
 /**
