@@ -28,15 +28,16 @@ const MODEL_MAPPING: Record<string, string> = {
     'claude-haiku-4-5-20251001': 'claude-sonnet-4-5',
 
     // OpenAI protocol mapping (maps to Gemini)
-    'gpt-4': 'gemini-2.5-pro',
-    'gpt-4-turbo': 'gemini-2.5-pro',
-    'gpt-4-turbo-preview': 'gemini-2.5-pro',
-    'gpt-4-0125-preview': 'gemini-2.5-pro',
-    'gpt-4-1106-preview': 'gemini-2.5-pro',
-    'gpt-4-0613': 'gemini-2.5-pro',
-    'gpt-4o': 'gemini-2.5-pro',
-    'gpt-4o-2024-05-13': 'gemini-2.5-pro',
-    'gpt-4o-2024-08-06': 'gemini-2.5-pro',
+    // All GPT-4 variants map to gemini-2.5-flash (matching Antigravity-Manager)
+    'gpt-4': 'gemini-2.5-flash',
+    'gpt-4-turbo': 'gemini-2.5-flash',
+    'gpt-4-turbo-preview': 'gemini-2.5-flash',
+    'gpt-4-0125-preview': 'gemini-2.5-flash',
+    'gpt-4-1106-preview': 'gemini-2.5-flash',
+    'gpt-4-0613': 'gemini-2.5-flash',
+    'gpt-4o': 'gemini-2.5-flash',
+    'gpt-4o-2024-05-13': 'gemini-2.5-flash',
+    'gpt-4o-2024-08-06': 'gemini-2.5-flash',
     'gpt-4o-mini': 'gemini-2.5-flash',
     'gpt-4o-mini-2024-07-18': 'gemini-2.5-flash',
     'gpt-3.5-turbo': 'gemini-2.5-flash',
@@ -48,15 +49,16 @@ const MODEL_MAPPING: Record<string, string> = {
     // Gemini protocol mapping
     'gemini-2.5-flash-lite': 'gemini-2.5-flash-lite',
     'gemini-2.5-flash-thinking': 'gemini-2.5-flash-thinking',
-    'gemini-3-pro-low': 'gemini-3-pro-low',
-    'gemini-3-pro-high': 'gemini-3-pro-high',
+    // Gemini 3 Pro variants all map to gemini-3-pro-preview (matching Antigravity-Manager)
+    'gemini-3-pro-low': 'gemini-3-pro-preview',
+    'gemini-3-pro-high': 'gemini-3-pro-preview',
     'gemini-3-pro-preview': 'gemini-3-pro-preview',
-    'gemini-3-pro': 'gemini-3-pro',  // [FIX PR #368] 添加基础模型支持
+    'gemini-3-pro': 'gemini-3-pro-preview',
     'gemini-2.5-flash': 'gemini-2.5-flash',
     'gemini-3-flash': 'gemini-3-flash',
     'gemini-3-pro-image': 'gemini-3-pro-image',
     'gemini-2.0-flash-exp': 'gemini-2.0-flash-exp',
-    'gemini-2.5-pro': 'gemini-2.5-pro',
+    // Note: gemini-2.5-pro removed (matching Antigravity-Manager)
 };
 
 // Custom model mapping (user-defined, can be extended at runtime)
@@ -162,10 +164,10 @@ export function getAllDynamicModelIds(): string[] {
     }
 
     // 3. Add common Gemini/image model IDs
+    // Note: gemini-2.5-pro removed (matching Antigravity-Manager)
     modelIds.add('gemini-3-pro-low');
     modelIds.add('gemini-2.0-flash-exp');
     modelIds.add('gemini-2.5-flash');
-    modelIds.add('gemini-2.5-pro');
     modelIds.add('gemini-3-flash');
     modelIds.add('gemini-3-pro-high');
 
@@ -363,12 +365,13 @@ export const ANTIGRAVITY_MODELS: AntigravityModelInfo[] = [
 
     // -------------------------------------------------------------------------
     // OpenAI Aliases (mapped to Gemini models)
+    // All GPT models map to gemini-2.5-flash (matching Antigravity-Manager)
     // -------------------------------------------------------------------------
     {
         id: 'gpt-4',
         name: 'GPT-4',
-        description: 'Maps to Gemini 2.5 Pro',
-        baseModel: 'gemini-2.5-pro',
+        description: 'Maps to Gemini 2.5 Flash',
+        baseModel: 'gemini-2.5-flash',
         family: 'gemini',
         contextWindow: 1048576,
         maxOutputTokens: 65536,
@@ -376,8 +379,8 @@ export const ANTIGRAVITY_MODELS: AntigravityModelInfo[] = [
     {
         id: 'gpt-4-turbo',
         name: 'GPT-4 Turbo',
-        description: 'Maps to Gemini 2.5 Pro',
-        baseModel: 'gemini-2.5-pro',
+        description: 'Maps to Gemini 2.5 Flash',
+        baseModel: 'gemini-2.5-flash',
         family: 'gemini',
         contextWindow: 1048576,
         maxOutputTokens: 65536,
@@ -385,8 +388,8 @@ export const ANTIGRAVITY_MODELS: AntigravityModelInfo[] = [
     {
         id: 'gpt-4-turbo-preview',
         name: 'GPT-4 Turbo Preview',
-        description: 'Maps to Gemini 2.5 Pro',
-        baseModel: 'gemini-2.5-pro',
+        description: 'Maps to Gemini 2.5 Flash',
+        baseModel: 'gemini-2.5-flash',
         family: 'gemini',
         contextWindow: 1048576,
         maxOutputTokens: 65536,
@@ -394,8 +397,8 @@ export const ANTIGRAVITY_MODELS: AntigravityModelInfo[] = [
     {
         id: 'gpt-4o',
         name: 'GPT-4o',
-        description: 'Maps to Gemini 2.5 Pro',
-        baseModel: 'gemini-2.5-pro',
+        description: 'Maps to Gemini 2.5 Flash',
+        baseModel: 'gemini-2.5-flash',
         family: 'gemini',
         contextWindow: 1048576,
         maxOutputTokens: 65536,
@@ -433,15 +436,8 @@ export const ANTIGRAVITY_MODELS: AntigravityModelInfo[] = [
 
     // -------------------------------------------------------------------------
     // Gemini 2.5 Models
+    // Note: gemini-2.5-pro removed (matching Antigravity-Manager)
     // -------------------------------------------------------------------------
-    {
-        id: 'gemini-2.5-pro',
-        name: 'Gemini 2.5 Pro',
-        baseModel: 'gemini-2.5-pro',
-        family: 'gemini',
-        contextWindow: 1048576,
-        maxOutputTokens: 65536,
-    },
     {
         id: 'gemini-2.5-flash',
         name: 'Gemini 2.5 Flash',
@@ -469,12 +465,13 @@ export const ANTIGRAVITY_MODELS: AntigravityModelInfo[] = [
 
     // -------------------------------------------------------------------------
     // Gemini 3.0 Models
+    // All Gemini 3 Pro variants map to gemini-3-pro-preview (matching Antigravity-Manager)
     // -------------------------------------------------------------------------
     {
         id: 'gemini-3-pro',
         name: 'Gemini 3 Pro',
-        description: 'Gemini 3 Pro base model',
-        baseModel: 'gemini-3-pro',
+        description: 'Maps to Gemini 3 Pro Preview',
+        baseModel: 'gemini-3-pro-preview',
         family: 'gemini',
         contextWindow: 1048576,
         maxOutputTokens: 65536,
@@ -482,7 +479,8 @@ export const ANTIGRAVITY_MODELS: AntigravityModelInfo[] = [
     {
         id: 'gemini-3-pro-low',
         name: 'Gemini 3 Pro Low',
-        baseModel: 'gemini-3-pro-low',
+        description: 'Maps to Gemini 3 Pro Preview',
+        baseModel: 'gemini-3-pro-preview',
         family: 'gemini',
         contextWindow: 1048576,
         maxOutputTokens: 65536,
@@ -490,7 +488,8 @@ export const ANTIGRAVITY_MODELS: AntigravityModelInfo[] = [
     {
         id: 'gemini-3-pro-high',
         name: 'Gemini 3 Pro High',
-        baseModel: 'gemini-3-pro-high',
+        description: 'Maps to Gemini 3 Pro Preview',
+        baseModel: 'gemini-3-pro-preview',
         family: 'gemini',
         contextWindow: 1048576,
         maxOutputTokens: 65536,
